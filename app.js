@@ -1,17 +1,18 @@
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
 
 /* ═══════════════════════════════════════════════════════════
-   LOCAL SERVER SYNC LAYER
-   Connects to the Node.js server on the same LAN via WebSocket.
-   No internet required — works entirely on local network.
+   LOCAL STORE — serverless, fully offline
+   All data lives on this device in localStorage.
+   Two devices sync by exchanging a JSON bundle via
+   Bluetooth, USB, cloud storage, or any file transfer.
 
-   Deduplication is handled server-side (UUID + content hash).
-   Client queues changes locally when the server is unreachable
-   and flushes them automatically on reconnect.
+   Three-layer deduplication (same as the server used):
+     1. UUID primary key  — INSERT OR IGNORE
+     2. Content hash      — same event in same minute = duplicate
+     3. Last-write-wins   — newer _updatedAt wins on same id
    ═══════════════════════════════════════════════════════════ */
 
 const SNAPSHOT_KEY = 'fnd_local_snapshot';
-const QUEUE_KEY    = 'fnd_sync_queue';
 
 function saveLocalSnapshot(data) {
   try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify({...data, _savedAt: new Date().toISOString()})); } catch(e) {}
@@ -20,17 +21,31 @@ function loadLocalSnapshot() {
   try { return JSON.parse(localStorage.getItem(SNAPSHOT_KEY)||'null'); } catch { return null; }
 }
 
-class ServerSync {
-  constructor({ onData, onStatus, onDevices }) {
-    this.onData    = onData;
-    this.onStatus  = onStatus;
-    this.onDevices = onDevices;
+/** Round ISO timestamp down to the nearest minute (for content-hash dedup). */
+function _floorMin(iso) {
+  const d = new Date(iso); d.setSeconds(0, 0); return d.toISOString();
+}
+
+/** Produce a stable dedup key for an entry (mirrors server-side contentHash). */
+function _contentKey(type, entry) {
+  switch (type) {
+    case 'event':   return `event|${_floorMin(entry.timestamp||'')}|${(entry.userName||'').toLowerCase().trim()}`;
+    case 'med':     return `med|${_floorMin(entry.timestamp||'')}|${(entry.name||'').toLowerCase().trim()}`;
+    case 'food':    return `food|${_floorMin(entry.timestamp||'')}|${(entry.name||'').toLowerCase().trim()}`;
+    case 'checkin': return `checkin|${(entry.timestamp||'').slice(0,10)}|${(entry.userName||'').toLowerCase().trim()}`;
+    default:        return `${type}|${entry.id}`;
+  }
+}
+
+class LocalStore {
+  constructor({ onData, onStatus }) {
+    this.onData     = onData;
+    this.onStatus   = onStatus;
     this.deviceId   = this._getOrCreateDeviceId();
     this.deviceName = localStorage.getItem('fnd_device_name') || '';
-    this.ws         = null;
-    this._reconnectTimer = null;
-    this.queue      = this._loadQueue();
-    this._connect();
+    // Data is already pre-loaded into React state from snapshot.
+    // Just signal ready so the UI can proceed.
+    setTimeout(() => this.onStatus('ready'), 0);
   }
 
   _getOrCreateDeviceId() {
@@ -42,128 +57,120 @@ class ServerSync {
     return id;
   }
 
-  _loadQueue() {
-    try { return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); } catch { return []; }
-  }
-  _saveQueue() {
-    try { localStorage.setItem(QUEUE_KEY, JSON.stringify(this.queue)); } catch {}
-  }
-  _clearQueue() {
-    this.queue = [];
-    localStorage.removeItem(QUEUE_KEY);
-  }
-
-  _connect() {
-    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
-    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const url   = `${proto}//${location.host}`;
-    try {
-      this.ws = new WebSocket(url);
-    } catch (e) {
-      this.onStatus('offline');
-      this._scheduleReconnect(5000);
-      return;
-    }
-
-    this.ws.onopen = () => {
-      this.onStatus('connecting');
-      this.ws.send(JSON.stringify({
-        type:       'register',
-        deviceId:   this.deviceId,
-        deviceName: this.deviceName || this.deviceId,
-      }));
-    };
-
-    this.ws.onmessage = (e) => {
-      let msg;
-      try { msg = JSON.parse(e.data); } catch { return; }
-
-      if (msg.type === 'full_sync') {
-        this.onData(msg.data, 'full');
-        this.onStatus('synced');
-        this._flushQueue();
-      }
-      if (msg.type === 'sync_batch') {
-        this.onData(msg.changes, 'patch');
-      }
-      if (msg.type === 'sync_ack') {
-        const acked = new Set(msg.accepted);
-        this.queue = this.queue.filter(c => !acked.has(c.id));
-        this._saveQueue();
-        this.onStatus('synced');
-      }
-      if (msg.type === 'delete') {
-        this.onData([{ id: msg.id, _delete: true }], 'patch');
-      }
-      if (msg.type === 'devices') {
-        this.onDevices(msg.devices);
-      }
-    };
-
-    this.ws.onclose = () => {
-      this.onStatus('offline');
-      this._scheduleReconnect(3000);
-    };
-
-    this.ws.onerror = () => {
-      this.onStatus('offline');
-      try { this.ws.close(); } catch {}
-    };
-  }
-
-  _scheduleReconnect(ms) {
-    clearTimeout(this._reconnectTimer);
-    this._reconnectTimer = setTimeout(() => this._connect(), ms);
-  }
-
-  /** Push a change to the server. Queues locally if offline. */
+  /** Tag outgoing change with device metadata before it is saved to snapshot. */
   push(change) {
     change._deviceId  = this.deviceId;
     change._updatedAt = new Date().toISOString();
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'sync_batch', changes: [change], deviceId: this.deviceId }));
-      this.onStatus('saving');
-    } else {
-      if (!this.queue.some(c => c.id === change.id)) {
-        this.queue.push(change);
-        this._saveQueue();
-      }
-      this.onStatus('offline');
-    }
+    // Actual persistence is via saveLocalSnapshot in the App mutation helpers.
   }
 
-  /** Notify server to soft-delete an entry; also broadcasts to other clients. */
-  pushDelete(id) {
-    if (this.ws?.readyState === WebSocket.OPEN) {
-      this.ws.send(JSON.stringify({ type: 'delete', id, deviceId: this.deviceId }));
-    }
+  /** No-op — deletes are filtered out of state + snapshot in the App. */
+  pushDelete(_id) {}
+
+  /**
+   * Export all local entries as a JSON sync bundle.
+   * @param {object} snap — { events, meds, food, checkins, pending }
+   */
+  exportSync(snap) {
+    const entries = [
+      ...(snap.events   || []).map(e => ({ ...e, _type: 'event'   })),
+      ...(snap.meds     || []).map(e => ({ ...e, _type: 'med'     })),
+      ...(snap.food     || []).map(e => ({ ...e, _type: 'food'    })),
+      ...(snap.checkins || []).map(e => ({ ...e, _type: 'checkin' })),
+      ...(snap.pending  || []).map(e => ({ ...e, _type: 'event', pending: true })),
+    ];
+    const payload = {
+      _fndSync:   true,
+      version:    1,
+      deviceId:   this.deviceId,
+      deviceName: this.deviceName || this.deviceId,
+      exportedAt: new Date().toISOString(),
+      entries,
+    };
+    downloadFile(
+      JSON.stringify(payload),
+      `fnd-sync-${new Date().toISOString().slice(0,10)}.json`,
+      'application/json'
+    );
   }
 
-  _flushQueue() {
-    if (this.queue.length === 0 || this.ws?.readyState !== WebSocket.OPEN) return;
-    this.ws.send(JSON.stringify({ type: 'sync_batch', changes: this.queue, deviceId: this.deviceId }));
-  }
-
-  /** Force a full re-sync from the server via REST (fallback when WS is down). */
-  async fetchFull() {
-    try {
-      this.onStatus('saving');
-      const r = await fetch('/api/data');
-      if (!r.ok) throw new Error('server error');
-      const { data } = await r.json();
-      this.onData(data, 'full');
-      this.onStatus('synced');
-    } catch {
-      this.onStatus('offline');
-    }
-  }
-
-  get connected() { return this.ws?.readyState === WebSocket.OPEN; }
+  get connected() { return true; }
 
   setDeviceName(name) {
     this.deviceName = name;
     localStorage.setItem('fnd_device_name', name);
   }
+}
+
+/**
+ * Parse a JSON sync bundle exported by another device.
+ * Returns { events, meds, food, checkins, from, totalEntries }.
+ */
+function parseSyncBundle(jsonText) {
+  const payload = JSON.parse(jsonText);
+  if (!payload._fndSync || !Array.isArray(payload.entries)) {
+    throw new Error('Not a valid FND Tracker sync file (.json)');
+  }
+  const result = { events: [], meds: [], food: [], checkins: [], from: payload.deviceName || payload.deviceId, totalEntries: payload.entries.length };
+  for (const e of payload.entries) {
+    if (!e || !e._type) continue;
+    switch (e._type) {
+      case 'event':   if (!e.pending) result.events.push(e);   break;
+      case 'med':     result.meds.push(e);     break;
+      case 'food':    result.food.push(e);     break;
+      case 'checkin': result.checkins.push(e); break;
+    }
+  }
+  return result;
+}
+
+/**
+ * Merge incoming data into existing lists with full deduplication:
+ *   - Same id + newer _updatedAt → update existing
+ *   - Same content key (different id) → skip (duplicate)
+ *   - New id + new content key → add
+ * Returns { events, meds, food, checkins } with counts of new records per type.
+ */
+function mergeWithDedup(existing, incoming) {
+  const result = {};
+  const added  = {};
+  const typeMap = { events:'event', meds:'med', food:'food', checkins:'checkin' };
+
+  for (const [listKey, entryType] of Object.entries(typeMap)) {
+    const cur  = existing[listKey]  || [];
+    const inc  = incoming[listKey]  || [];
+
+    // Build lookup maps
+    const byId   = new Map(cur.map(e => [e.id, e]));
+    const hashes = new Set(cur.map(e => _contentKey(entryType, e)));
+
+    let newCount = 0;
+    const toAdd  = [];
+
+    for (const entry of inc) {
+      if (!entry || !entry.id) continue;
+      const hash = _contentKey(entryType, entry);
+
+      if (byId.has(entry.id)) {
+        // Same ID → last-write-wins
+        const existing_ = byId.get(entry.id);
+        if ((entry._updatedAt || '') > (existing_._updatedAt || '')) {
+          byId.set(entry.id, entry);
+          newCount++;
+        }
+      } else if (!hashes.has(hash)) {
+        // New content → add
+        toAdd.push(entry);
+        hashes.add(hash);
+        newCount++;
+      }
+      // Else: duplicate content with different ID → silently skip
+    }
+
+    result[listKey] = [...cur.map(e => byId.get(e.id)), ...toAdd];
+    added[listKey]  = newCount;
+  }
+  return { merged: result, added };
 }
 
 /* ═══════════════════════════════════════════════════════════
@@ -1190,7 +1197,7 @@ function buildReport(events,meds,food){
 /* ═══════════════════════════════════════════════════════════
    EXPORT TAB (includes Import)
    ═══════════════════════════════════════════════════════════ */
-function ExportTab({events,meds,food,onReset,onImport,deviceName,onRenameDevice,showFlash}){
+function ExportTab({events,meds,food,onReset,onImport,onSyncExport,onSyncImport,deviceName,onRenameDevice,showFlash}){
   const[confirmReset,setConfirmReset]=useState(false);
   const[editingName,setEditingName]=useState(false);
   const[nameInput,setNameInput]=useState(deviceName||'');
@@ -1198,8 +1205,25 @@ function ExportTab({events,meds,food,onReset,onImport,deviceName,onRenameDevice,
   const[importError,setImportError]=useState(null);
   const[showFormat,setShowFormat]=useState(false);
   const[openSection,setOpenSection]=useState(null);
+  const[syncImportError,setSyncImportError]=useState(null);
   const fileRef=useRef(null);
+  const syncFileRef=useRef(null);
   const toggle=s=>setOpenSection(o=>o===s?null:s);
+
+  // ── JSON sync file handler ────────────────────────────────
+  const handleSyncFileSelect=(e)=>{
+    const file=e.target.files[0];if(!file)return;
+    setSyncImportError(null);
+    const reader=new FileReader();
+    reader.onload=(ev)=>{
+      try{
+        onSyncImport(ev.target.result);
+      }catch(err){
+        setSyncImportError(err.message);
+      }
+    };
+    reader.readAsText(file);e.target.value='';
+  };
 
   // ── CSV parsing ──────────────────────────────────────────
   const parseCSV=(text)=>{
@@ -1300,9 +1324,43 @@ function ExportTab({events,meds,food,onReset,onImport,deviceName,onRenameDevice,
         {spanDays>0&&<div style={{color:C.muted,fontSize:11,textAlign:"center"}}>{fmtDate(earliest.toISOString())} – {fmtDate(latest.toISOString())} · {spanDays} days of data</div>}
       </div>
 
+      {/* ── Device Sync accordion ─────────────────────────── */}
+      <div style={{background:C.card,border:`1px solid ${openSection==="devicesync"?C.amber:C.border}`,borderRadius:12,padding:16}}>
+        <AccordionHeader id="devicesync" icon="📡" title="Device Sync" desc="Share data between two phones — no network needed" color={C.amber}/>
+        {openSection==="devicesync"&&(
+          <div style={{marginTop:14,display:"flex",flexDirection:"column",gap:12}}>
+            {/* Export bundle */}
+            <div style={{background:"#0a0f1a",border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px"}}>
+              <div style={{color:C.amber,fontSize:12,fontWeight:700,marginBottom:4}}>📤 Step 1 — Export from this device</div>
+              <div style={{color:C.muted,fontSize:11,marginBottom:10}}>Creates a <code style={{color:C.text,background:"#1e293b",padding:"1px 5px",borderRadius:4}}>.json</code> file with all your entries. Transfer it to the other device via Bluetooth, USB, cloud storage, or messaging.</div>
+              <Btn onClick={onSyncExport} fullWidth small>⬇ Export sync bundle (.json)</Btn>
+            </div>
+            {/* Import bundle */}
+            <div style={{background:"#0a0f1a",border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px"}}>
+              <div style={{color:C.amber,fontSize:12,fontWeight:700,marginBottom:4}}>📥 Step 2 — Import on this device</div>
+              <div style={{color:C.muted,fontSize:11,marginBottom:10}}>Pick the <code style={{color:C.text,background:"#1e293b",padding:"1px 5px",borderRadius:4}}>.json</code> file from the other phone. Duplicates are automatically detected and skipped using content-hash matching.</div>
+              {syncImportError&&<div style={{color:C.red,fontSize:12,marginBottom:8,padding:"8px 12px",background:"#450a0a",borderRadius:8}}>{syncImportError}</div>}
+              <input ref={syncFileRef} type="file" accept=".json,application/json" onChange={handleSyncFileSelect} style={{display:"none"}}/>
+              <Btn onClick={()=>{setSyncImportError(null);syncFileRef.current.click();}} fullWidth small>📂 Choose sync file (.json)</Btn>
+            </div>
+            {/* How-to guide */}
+            <div style={{background:"#0a1a10",border:`1px solid #1a3a20`,borderRadius:10,padding:"12px 14px"}}>
+              <div style={{color:C.teal,fontSize:11,fontWeight:700,marginBottom:6}}>How to sync two phones (both ways):</div>
+              <ol style={{color:C.muted,fontSize:11,lineHeight:1.9,paddingLeft:18,margin:0}}>
+                <li>On <b style={{color:C.text}}>Phone A</b> — tap "Export sync bundle", share the file to Phone B</li>
+                <li>On <b style={{color:C.text}}>Phone B</b> — tap "Import sync file", pick the file → new entries are merged in</li>
+                <li>On <b style={{color:C.text}}>Phone B</b> — tap "Export sync bundle", share back to Phone A</li>
+                <li>On <b style={{color:C.text}}>Phone A</b> — tap "Import sync file" → both devices are now fully in sync</li>
+              </ol>
+              <div style={{color:"#4b5563",fontSize:10,marginTop:8}}>Duplicate entries (same event, same minute, same user) are automatically dropped. Last-write-wins for edited entries.</div>
+            </div>
+          </div>
+        )}
+      </div>
+
       {/* Export accordion */}
       <div style={{background:C.card,border:`1px solid ${openSection==="export"?C.green:C.border}`,borderRadius:12,padding:16}}>
-        <AccordionHeader id="export" icon="📤" title="Export" desc="Download your data as CSV or a physician report" color={C.green}/>
+        <AccordionHeader id="export" icon="📤" title="Export (CSV / Report)" desc="Download your data as CSV or a physician report" color={C.green}/>
         {openSection==="export"&&(
           <div style={{marginTop:14,display:"flex",flexDirection:"column",gap:10}}>
             <div style={{background:"#0a0f1a",border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px"}}>
@@ -1444,7 +1502,7 @@ function ExportTab({events,meds,food,onReset,onImport,deviceName,onRenameDevice,
         </button>
         {confirmReset&&(
           <div style={{marginTop:14}}>
-            <div style={{color:C.amber,fontSize:12,lineHeight:1.6,marginBottom:12}}>This will permanently delete all your data from Google Drive. Export a backup first.</div>
+            <div style={{color:C.amber,fontSize:12,lineHeight:1.6,marginBottom:12}}>This will permanently delete all local data on this device. Export a sync bundle or CSV backup first.</div>
             <div style={{display:"flex",gap:8}}>
               <Btn onClick={()=>setConfirmReset(false)} variant="secondary" fullWidth>Cancel</Btn>
               <Btn onClick={onReset} danger fullWidth>Yes, Reset Everything</Btn>
@@ -1468,7 +1526,7 @@ function DeviceSetup({onReady}){
       <div style={{fontSize:"2.5rem",marginBottom:12}}>⚡</div>
       <h1 style={{fontWeight:800,fontSize:"1.5rem",marginBottom:8,color:C.green}}>FND Tracker</h1>
       <p style={{color:C.muted,fontSize:13,marginBottom:6,lineHeight:1.6,maxWidth:340}}>Give this device a name so entries are labelled correctly when syncing between devices.</p>
-      <p style={{color:"#374151",fontSize:12,marginBottom:24,maxWidth:320}}>The server must be running on the same network — open the URL it printed at startup.</p>
+      <p style={{color:"#374151",fontSize:12,marginBottom:24,maxWidth:320}}>No internet or server needed — all data is stored on this device. Sync with other devices via the Import/Export tab.</p>
       <div style={{width:"100%",maxWidth:360}}>
         <FInput label="Device / Person Name" placeholder="e.g. Sarah's Phone, Caregiver Tablet…" value={name} onChange={e=>setName(e.target.value)} autoFocus/>
         <Btn onClick={()=>{const n=name.trim();if(!n)return;localStorage.setItem('fnd_device_name',n);onReady(n);}} fullWidth disabled={!name.trim()}>Start →</Btn>
@@ -1489,9 +1547,7 @@ function App(){
   const[appReady,setAppReady]=useState(()=>!!localStorage.getItem('fnd_device_name'));
 
   // ── Sync state ──────────────────────────────────────────
-  const[syncStatus,setSyncStatus]=useState('offline');
-  const[lastSynced,setLastSynced]=useState(null);
-  const[connectedDevices,setConnectedDevices]=useState([]);
+  const[syncStatus,setSyncStatus]=useState('ready');
   const syncRef=useRef(null);
 
   // ── App data — pre-populate from local snapshot if available ─
@@ -1553,16 +1609,14 @@ function App(){
     }
   }, []);
 
-  // ── Initialise sync engine once device is named ────────────
+  // ── Initialise local store once device is named ──────────
   useEffect(() => {
     if (!appReady) return;
-    const sync = new ServerSync({
+    const store = new LocalStore({
       onData: applyServerData,
-      onStatus: s => { setSyncStatus(s); if (s === 'synced') setLastSynced(new Date().toISOString()); },
-      onDevices: setConnectedDevices,
+      onStatus: setSyncStatus,
     });
-    syncRef.current = sync;
-    return () => { try { sync.ws?.close(); } catch {} };
+    syncRef.current = store;
   }, [appReady, applyServerData]);
 
   // ── Data mutation helpers ─────────────────────────────────
@@ -1654,7 +1708,32 @@ function App(){
     }
   };
   const handleRenameDevice=name=>{setDeviceName(name);syncRef.current?.setDeviceName(name);};
-  const manualSync=()=>syncRef.current?.fetchFull()||showFlash('Reconnecting…',C.amber);
+
+  /** Export a full JSON sync bundle for transferring to another device. */
+  const handleSyncExport=()=>{
+    syncRef.current?.exportSync({events,pending,meds,food,checkins});
+    showFlash("📤 Sync file ready to share",C.amber);
+  };
+
+  /** Import a JSON sync bundle from another device. */
+  const handleSyncImport=(jsonText)=>{
+    try{
+      const incoming=parseSyncBundle(jsonText);
+      const{merged,added}=mergeWithDedup({events,meds,food,checkins},incoming);
+      const byTs=(a,b)=>new Date(b.timestamp)-new Date(a.timestamp);
+      setEvents(merged.events.sort(byTs));
+      setMeds(merged.meds.sort(byTs));
+      setFood(merged.food.sort(byTs));
+      setCheckins(merged.checkins.sort(byTs));
+      saveLocalSnapshot({...snap(),events:merged.events,meds:merged.meds,food:merged.food,checkins:merged.checkins});
+      const total=added.events+added.meds+added.food+added.checkins;
+      showFlash(`✅ Synced from ${incoming.from} — ${total} new record${total!==1?'s':''} added`,C.green);
+    }catch(e){
+      showFlash(`⚠ Import failed: ${e.message}`,C.red);
+    }
+  };
+
+  const goToSync=()=>{setTab("export");};  // helper to jump to sync tab
 
   // ── Computed ──────────────────────────────────────────────
   const todayEvents=filterFrom(events,startOf("day"));
@@ -1675,9 +1754,8 @@ function App(){
   if(!appReady) return <DeviceSetup onReady={name=>{setDeviceName(name);setAppReady(true);}}/>;
 
   // ── Sync status label ─────────────────────────────────────
-  const queueLen=syncRef.current?.queue?.length||0;
-  const syncLabel=syncStatus==='saving'?'Saving…':syncStatus==='connecting'?'Connecting…':syncStatus==='offline'&&queueLen>0?`${queueLen} queued`:syncStatus==='offline'?'Offline':'✓ Synced';
-  const syncColor=syncStatus==='offline'?C.amber:syncStatus==='synced'?C.green:C.sub;
+  const syncLabel=syncStatus==='saving'?'Saving…':'✓ On Device';
+  const syncColor=C.green;
   const userInfo={name:deviceName,email:''};
 
   // ── HOME CONTENT ──────────────────────────────────────────
@@ -1759,11 +1837,11 @@ function App(){
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px"}}><div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Longest Gap</div><div style={{color:C.teal,fontSize:desk?32:22,fontWeight:800,lineHeight:1}}>{longestGapDays>0?`${Math.round(longestGapDays)}d`:"—"}</div><div style={{color:C.muted,fontSize:11,marginTop:4}}>between events</div></div>
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px"}}><div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Total Recorded</div><div style={{color:C.sub,fontSize:desk?32:22,fontWeight:800,lineHeight:1}}>{events.length}</div><div style={{color:C.muted,fontSize:11,marginTop:4}}>all time</div></div>
         <div style={{background:streak>0?"#052e16":C.card,border:`1px solid ${streak>0?C.green:C.border}`,borderRadius:12,padding:"14px 16px"}}><div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>{streak>0?"Streak":"Clear Days (30d)"}</div><div style={{color:streak>0?C.green:C.teal,fontSize:desk?32:22,fontWeight:800,lineHeight:1}}>{streak>0?`${streak}d`:clearDays30}</div><div style={{color:C.muted,fontSize:11,marginTop:4}}>{streak>0?"seizure-free 🌙":"days without events"}</div></div>
-        {/* Sync status tile */}
-        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",cursor:"pointer"}} onClick={manualSync}>
-          <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Server Sync</div>
+        {/* Device Sync tile */}
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",cursor:"pointer"}} onClick={goToSync}>
+          <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Device Sync</div>
           <div style={{color:syncColor,fontSize:desk?20:16,fontWeight:800,lineHeight:1.2}}>{syncLabel}</div>
-          <div style={{color:C.muted,fontSize:11,marginTop:4}}>{connectedDevices.length>0?`${connectedDevices.length} device${connectedDevices.length!==1?'s':''} online`:lastSynced?`Last: ${fmtTime(lastSynced)}`:"Tap to refresh"}</div>
+          <div style={{color:C.muted,fontSize:11,marginTop:4}}>Tap to export / import</div>
         </div>
       </div>
     </div>
@@ -1775,7 +1853,7 @@ function App(){
       {tab==="home"&&homeContent}
       {tab==="trends"&&<TrendsTab events={events} food={food}/>}
       {tab==="log"&&<LogTab events={events} pending={pending} meds={meds} food={food} delEvent={delEvent} delPending={delPending} delMed={delMed} delFood={delFood} setEditing={setEditing} approveAll={approveAll}/>}
-      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} onImport={handleImport} deviceName={deviceName} onRenameDevice={handleRenameDevice} showFlash={showFlash}/>}
+      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} onImport={handleImport} onSyncExport={handleSyncExport} onSyncImport={handleSyncImport} deviceName={deviceName} onRenameDevice={handleRenameDevice} showFlash={showFlash}/>}
     </>
   );
 
@@ -1846,10 +1924,9 @@ function App(){
           </button>
         </div>
         <div style={{padding:"10px 18px 20px",borderTop:`1px solid ${C.border}`}}>
-          <button onClick={manualSync} style={{width:"100%",background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,color:syncColor,fontSize:12,fontWeight:600}}>
-            <span>{syncStatus==='synced'?'✓':'⏳'}</span><span style={{flex:1}}>{syncLabel}</span>
+          <button onClick={goToSync} style={{width:"100%",background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,color:syncColor,fontSize:12,fontWeight:600}}>
+            <span>✓</span><span style={{flex:1}}>On Device · Tap to Sync</span>
           </button>
-          {connectedDevices.length>0&&<div style={{color:C.muted,fontSize:10,textAlign:"center",marginTop:5}}>{connectedDevices.map(d=>d.name||d.id).join(' · ')}</div>}
         </div>
       </aside>
       <main style={{marginLeft:SIDEBAR_W,flex:1,minHeight:"100vh"}}>
@@ -1873,10 +1950,10 @@ function App(){
           <div style={{color:C.green,fontWeight:800,fontSize:22,letterSpacing:-0.5}}>⚡ FND Tracker</div>
           <div style={{color:"#374151",fontSize:12}}>{new Date().toLocaleDateString([],{weekday:"long",month:"long",day:"numeric"})}</div>
         </div>
-        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"6px 14px",textAlign:"center",cursor:"pointer"}} onClick={manualSync}>
+        <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"6px 14px",textAlign:"center",cursor:"pointer"}} onClick={goToSync}>
           <div style={{color:C.green,fontSize:22,fontWeight:800,lineHeight:1}}>{todayEvents.length}</div>
           <div style={{color:C.muted,fontSize:10}}>today</div>
-          <div style={{color:syncColor,fontSize:9,marginTop:1}}>{connectedDevices.length>0?`${connectedDevices.length} online`:syncLabel}</div>
+          <div style={{color:syncColor,fontSize:9,marginTop:1}}>✓ On Device</div>
         </div>
       </div>
       <div style={{padding:"14px 18px"}}>{tabContent}</div>

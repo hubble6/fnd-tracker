@@ -1,16 +1,21 @@
 {
   "name": "fnd-tracker",
-  "version": "2.0.0",
-  "description": "FND Tracker — offline-first multi-device symptom tracker",
-  "main": "server.js",
+  "version": "3.0.0",
+  "description": "FND Tracker — offline-first, serverless symptom tracker. No network required.",
   "scripts": {
-    "start": "node server.js",
-    "dev": "node --watch server.js"
+    "serve": "npx serve . -p 3000",
+    "cap:init": "npx cap init 'FND Tracker' com.fndtracker.app --web-dir .",
+    "cap:android": "npx cap add android",
+    "cap:sync": "npx cap sync android",
+    "cap:build": "npx cap build android",
+    "cap:open": "npx cap open android"
   },
   "dependencies": {
-    "better-sqlite3": "^9.4.3",
-    "express": "^4.18.3",
-    "uuid": "^9.0.1",
-    "ws": "^8.16.0"
+    "@babel/standalone": "^7.29.2",
+    "@capacitor/android": "^6.0.0",
+    "@capacitor/cli": "^6.0.0",
+    "@capacitor/core": "^6.0.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
   }
 }

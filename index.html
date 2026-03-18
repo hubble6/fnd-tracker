@@ -10,6 +10,7 @@
   <link rel="apple-touch-icon" href="icons/icon-192.png"/>
   <link rel="manifest" href="manifest.json"/>
   <title>FND Tracker</title>
+  <!-- Fonts loaded from CDN with offline fallback via service worker cache -->
   <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
   <style>
     *,*::before,*::after{box-sizing:border-box;margin:0;padding:0;}
@@ -37,9 +38,10 @@
     if(m)m.textContent='Taking longer than expected…';if(b)b.style.display='block';
   },5000);
 </script>
-<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
-<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
-<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<!-- Vendor scripts bundled locally — works fully offline and in APK -->
+<script src="vendor/react.production.min.js"></script>
+<script src="vendor/react-dom.production.min.js"></script>
+<script src="vendor/babel.min.js"></script>
 <script src="app.js" type="text/babel"></script>
 <script>if('serviceWorker'in navigator)window.addEventListener('load',()=>navigator.serviceWorker.register('./sw.js').catch(()=>{}));</script>
 </body>
