@@ -1,7 +1,5 @@
-// FND Tracker — Service Worker v4 (offline-first)
-// Caches the full app shell including app.js and CDN scripts.
-
-const CACHE = 'fnd-drive-v4';
+// FND Tracker — Service Worker v5
+const CACHE = 'fnd-drive-v5';
 
 const SHELL = [
   './',
