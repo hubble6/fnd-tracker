@@ -1,103 +1,168 @@
 const { useState, useEffect, useCallback, useRef, useMemo } = React;
 
 /* ═══════════════════════════════════════════════════════════
-   GOOGLE DRIVE SYNC LAYER
+   LOCAL SERVER SYNC LAYER
+   Connects to the Node.js server on the same LAN via WebSocket.
+   No internet required — works entirely on local network.
+
+   Deduplication is handled server-side (UUID + content hash).
+   Client queues changes locally when the server is unreachable
+   and flushes them automatically on reconnect.
    ═══════════════════════════════════════════════════════════ */
-const DRIVE_FILE_NAME = 'fnd-tracker-data.json';
-const SCOPES = 'https://www.googleapis.com/auth/drive.file openid email profile';
-const QUEUE_KEY = 'fnd_offline_queue';
-const SHARED_FILE_KEY = 'fnd_shared_file_id'; // caregiver sets this to share a file
 
-function loadQueue() { try { return JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]'); } catch { return []; } }
-function saveQueue(q) { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); }
-function clearQueue() { localStorage.removeItem(QUEUE_KEY); }
-
-// Full local data snapshot — persisted independently of the queue
-// so the app can load data even when Drive/auth is unavailable
-const LOCAL_DATA_KEY = 'fnd_local_snapshot';
-const SESSION_KEY    = 'fnd_session';          // persists user info across restarts
+const SNAPSHOT_KEY = 'fnd_local_snapshot';
+const QUEUE_KEY    = 'fnd_sync_queue';
 
 function saveLocalSnapshot(data) {
-  try { localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify({...data, _savedAt: new Date().toISOString()})); } catch(e) {}
+  try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify({...data, _savedAt: new Date().toISOString()})); } catch(e) {}
 }
 function loadLocalSnapshot() {
-  try { return JSON.parse(localStorage.getItem(LOCAL_DATA_KEY)||'null'); } catch { return null; }
-}
-function saveSession(info) {
-  try {
-    if(!info || typeof info !== 'object') return;
-    localStorage.setItem(SESSION_KEY, JSON.stringify(info));
-  } catch(e) {}
-}
-function loadSession() {
-  try {
-    const raw = localStorage.getItem(SESSION_KEY);
-    if(!raw) return null;
-    const parsed = JSON.parse(raw);
-    // Must be a non-null object to count as a valid session
-    if(!parsed || typeof parsed !== 'object') return null;
-    return parsed;
-  } catch { return null; }
-}
-function clearSession() {
-  localStorage.removeItem(SESSION_KEY);
-  localStorage.removeItem(LOCAL_DATA_KEY);
-  // NOTE: deliberately keep fnd_file_id and fnd_shared_file_id
-  // so the next sign-in reconnects to the same Drive file
+  try { return JSON.parse(localStorage.getItem(SNAPSHOT_KEY)||'null'); } catch { return null; }
 }
 
-class DriveSync {
-  constructor(token) { this.token = token; }
-  async req(url, opts={}) {
-    const r = await fetch(url, { ...opts, headers: { 'Authorization': `Bearer ${this.token}`, ...(opts.headers||{}) } });
-    if (!r.ok) throw new Error(`Drive ${r.status}: ${await r.text()}`);
-    return r;
+class ServerSync {
+  constructor({ onData, onStatus, onDevices }) {
+    this.onData    = onData;
+    this.onStatus  = onStatus;
+    this.onDevices = onDevices;
+    this.deviceId   = this._getOrCreateDeviceId();
+    this.deviceName = localStorage.getItem('fnd_device_name') || '';
+    this.ws         = null;
+    this._reconnectTimer = null;
+    this.queue      = this._loadQueue();
+    this._connect();
   }
-  async findFile() {
-    // Search all drives including shared-with-me files
-    // includeItemsFromAllDrives + corpora=allDrives finds shared files too
-    const params = new URLSearchParams({
-      q: `name='${DRIVE_FILE_NAME}' and trashed=false`,
-      fields: 'files(id,name,modifiedTime)',
-      includeItemsFromAllDrives: 'true',
-      supportsAllDrives: 'true',
-      corpora: 'allDrives',
-    });
-    try {
-      const r = await this.req(`https://www.googleapis.com/drive/v3/files?${params}`);
-      const d = await r.json();
-      if(d.files?.[0]) return d.files[0];
-    } catch(e) {}
-    // Fallback: search only own drive
-    try {
-      const r2 = await this.req(`https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name,modifiedTime)&spaces=drive`);
-      const d2 = await r2.json();
-      return d2.files?.[0] || null;
-    } catch(e) { return null; }
-  }
-  async createFile(data) {
-    const form = new FormData();
-    form.append('metadata', new Blob([JSON.stringify({ name: DRIVE_FILE_NAME, mimeType: 'application/json' })], { type: 'application/json' }));
-    form.append('file', new Blob([JSON.stringify(data)], { type: 'application/json' }));
-    const r = await this.req('https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id', { method:'POST', body:form });
-    return (await r.json()).id;
-  }
-  async readFile(id) {
-    const r = await this.req(`https://www.googleapis.com/drive/v3/files/${id}?alt=media`);
-    return r.json();
-  }
-  async writeFile(id, data) {
-    await this.req(`https://www.googleapis.com/upload/drive/v3/files/${id}?uploadType=media`, { method:'PATCH', headers:{'Content-Type':'application/json'}, body:JSON.stringify(data) });
-  }
-  async init() {
-    let file = await this.findFile();
-    if (!file) {
-      const empty = { events:[], pending:[], meds:[], food:[], medLib:[], foodLib:[], device:null, checkins:[], version:1, createdAt:new Date().toISOString() };
-      const id = await this.createFile(empty);
-      return { fileId:id, data:empty, isNew:true };
+
+  _getOrCreateDeviceId() {
+    let id = localStorage.getItem('fnd_device_id');
+    if (!id) {
+      id = 'dev_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 8);
+      localStorage.setItem('fnd_device_id', id);
     }
-    const data = await this.readFile(file.id);
-    return { fileId:file.id, data, isNew:false };
+    return id;
+  }
+
+  _loadQueue() {
+    try { return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); } catch { return []; }
+  }
+  _saveQueue() {
+    try { localStorage.setItem(QUEUE_KEY, JSON.stringify(this.queue)); } catch {}
+  }
+  _clearQueue() {
+    this.queue = [];
+    localStorage.removeItem(QUEUE_KEY);
+  }
+
+  _connect() {
+    if (this.ws && (this.ws.readyState === WebSocket.CONNECTING || this.ws.readyState === WebSocket.OPEN)) return;
+    const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+    const url   = `${proto}//${location.host}`;
+    try {
+      this.ws = new WebSocket(url);
+    } catch (e) {
+      this.onStatus('offline');
+      this._scheduleReconnect(5000);
+      return;
+    }
+
+    this.ws.onopen = () => {
+      this.onStatus('connecting');
+      this.ws.send(JSON.stringify({
+        type:       'register',
+        deviceId:   this.deviceId,
+        deviceName: this.deviceName || this.deviceId,
+      }));
+    };
+
+    this.ws.onmessage = (e) => {
+      let msg;
+      try { msg = JSON.parse(e.data); } catch { return; }
+
+      if (msg.type === 'full_sync') {
+        this.onData(msg.data, 'full');
+        this.onStatus('synced');
+        this._flushQueue();
+      }
+      if (msg.type === 'sync_batch') {
+        this.onData(msg.changes, 'patch');
+      }
+      if (msg.type === 'sync_ack') {
+        const acked = new Set(msg.accepted);
+        this.queue = this.queue.filter(c => !acked.has(c.id));
+        this._saveQueue();
+        this.onStatus('synced');
+      }
+      if (msg.type === 'delete') {
+        this.onData([{ id: msg.id, _delete: true }], 'patch');
+      }
+      if (msg.type === 'devices') {
+        this.onDevices(msg.devices);
+      }
+    };
+
+    this.ws.onclose = () => {
+      this.onStatus('offline');
+      this._scheduleReconnect(3000);
+    };
+
+    this.ws.onerror = () => {
+      this.onStatus('offline');
+      try { this.ws.close(); } catch {}
+    };
+  }
+
+  _scheduleReconnect(ms) {
+    clearTimeout(this._reconnectTimer);
+    this._reconnectTimer = setTimeout(() => this._connect(), ms);
+  }
+
+  /** Push a change to the server. Queues locally if offline. */
+  push(change) {
+    change._deviceId  = this.deviceId;
+    change._updatedAt = new Date().toISOString();
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'sync_batch', changes: [change], deviceId: this.deviceId }));
+      this.onStatus('saving');
+    } else {
+      if (!this.queue.some(c => c.id === change.id)) {
+        this.queue.push(change);
+        this._saveQueue();
+      }
+      this.onStatus('offline');
+    }
+  }
+
+  /** Notify server to soft-delete an entry; also broadcasts to other clients. */
+  pushDelete(id) {
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.ws.send(JSON.stringify({ type: 'delete', id, deviceId: this.deviceId }));
+    }
+  }
+
+  _flushQueue() {
+    if (this.queue.length === 0 || this.ws?.readyState !== WebSocket.OPEN) return;
+    this.ws.send(JSON.stringify({ type: 'sync_batch', changes: this.queue, deviceId: this.deviceId }));
+  }
+
+  /** Force a full re-sync from the server via REST (fallback when WS is down). */
+  async fetchFull() {
+    try {
+      this.onStatus('saving');
+      const r = await fetch('/api/data');
+      if (!r.ok) throw new Error('server error');
+      const { data } = await r.json();
+      this.onData(data, 'full');
+      this.onStatus('synced');
+    } catch {
+      this.onStatus('offline');
+    }
+  }
+
+  get connected() { return this.ws?.readyState === WebSocket.OPEN; }
+
+  setDeviceName(name) {
+    this.deviceName = name;
+    localStorage.setItem('fnd_device_name', name);
   }
 }
 
@@ -1125,9 +1190,10 @@ function buildReport(events,meds,food){
 /* ═══════════════════════════════════════════════════════════
    EXPORT TAB (includes Import)
    ═══════════════════════════════════════════════════════════ */
-function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut,showFlash}){
+function ExportTab({events,meds,food,onReset,onImport,deviceName,onRenameDevice,showFlash}){
   const[confirmReset,setConfirmReset]=useState(false);
-  const[confirmSignOut,setConfirmSignOut]=useState(false);
+  const[editingName,setEditingName]=useState(false);
+  const[nameInput,setNameInput]=useState(deviceName||'');
   const[importState,setImportState]=useState(null);
   const[importError,setImportError]=useState(null);
   const[showFormat,setShowFormat]=useState(false);
@@ -1347,56 +1413,33 @@ function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut,showFla
         )}
       </div>
 
-      {/* Account */}
+      {/* Device Identity */}
       <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
-        <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.07em",marginBottom:12}}>Account</div>
-        <div style={{display:"flex",alignItems:"center",gap:12,marginBottom:12}}>
-          {userInfo?.picture&&<img src={userInfo.picture} style={{width:40,height:40,borderRadius:"50%"}} alt=""/>}
-          <div><div style={{fontWeight:600,fontSize:14}}>{userInfo?.name||"Signed in"}</div><div style={{color:C.muted,fontSize:12}}>{userInfo?.email}</div></div>
-        </div>
-        {confirmSignOut?(
+        <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.07em",marginBottom:12}}>This Device</div>
+        {editingName?(
           <div>
-            <div style={{color:C.amber,fontSize:13,marginBottom:10,lineHeight:1.5}}>Sign out? You'll need to sign in again to sync with Drive.</div>
+            <FInput label="Device / Person Name" value={nameInput} onChange={e=>setNameInput(e.target.value)} autoFocus/>
             <div style={{display:"flex",gap:8}}>
-              <Btn onClick={()=>setConfirmSignOut(false)} variant="secondary" fullWidth>Cancel</Btn>
-              <Btn onClick={onSignOut} danger fullWidth>Yes, Sign Out</Btn>
+              <Btn onClick={()=>setEditingName(false)} variant="secondary" fullWidth>Cancel</Btn>
+              <Btn onClick={()=>{if(!nameInput.trim())return;onRenameDevice(nameInput.trim());setEditingName(false);showFlash('Device name updated');}} fullWidth>Save</Btn>
             </div>
           </div>
         ):(
-          <Btn onClick={()=>setConfirmSignOut(true)} variant="secondary" fullWidth>Sign Out</Btn>
+          <div style={{display:"flex",alignItems:"center",gap:12}}>
+            <div style={{flex:1}}>
+              <div style={{fontWeight:600,fontSize:14}}>{deviceName||"Unknown device"}</div>
+              <div style={{color:C.muted,fontSize:11,marginTop:1}}>Name shown on entries from this device</div>
+            </div>
+            <Btn onClick={()=>{setNameInput(deviceName||'');setEditingName(true);}} variant="secondary" small>Rename</Btn>
+          </div>
         )}
       </div>
-
-      {/* Shared File ID — for caregiver device to connect to owner's Drive file */}
-      {(()=>{
-        const[sharedId,setSharedId]=useState(localStorage.getItem('fnd_shared_file_id')||'');
-        const[saved,setSaved]=useState(!!localStorage.getItem('fnd_shared_file_id'));
-        return(
-          <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
-            <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.07em",marginBottom:6}}>Shared Drive File</div>
-            <div style={{color:C.muted,fontSize:12,marginBottom:10,lineHeight:1.5}}>If someone shared their Drive file with you, paste the file ID here so both devices sync to the same data.</div>
-            <input
-              style={{...IS,marginBottom:8,fontSize:12,fontFamily:"monospace"}}
-              placeholder="Paste Google Drive file ID…"
-              value={sharedId}
-              onChange={e=>{ setSharedId(e.target.value.trim()); setSaved(false); }}
-            />
-            <div style={{display:"flex",gap:8}}>
-              <Btn onClick={()=>{ localStorage.setItem('fnd_shared_file_id',sharedId); setSaved(true); showFlash&&showFlash('File ID saved — sign out and back in to connect'); }} disabled={!sharedId||saved} fullWidth small>
-                {saved?'✓ Saved':'Save File ID'}
-              </Btn>
-              {saved&&<Btn onClick={()=>{ localStorage.removeItem('fnd_shared_file_id'); setSharedId(''); setSaved(false); }} variant="secondary" small>Clear</Btn>}
-            </div>
-            {saved&&<div style={{color:C.green,fontSize:11,marginTop:6}}>✓ Connected — sign out and back in to load shared data</div>}
-          </div>
-        );
-      })()}
 
       {/* Reset */}
       <div style={{background:"#0d0505",border:`1px solid ${confirmReset?"#dc2626":"#3f1a1a"}`,borderRadius:12,padding:16}}>
         <button onClick={()=>setConfirmReset(v=>!v)} style={{width:"100%",display:"flex",alignItems:"center",gap:12,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
           <div style={{width:36,height:36,borderRadius:10,background:confirmReset?"#450a0a":"#1e0a0a",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0,border:`1px solid ${confirmReset?"#dc2626":"#7f1d1d"}`}}>⚠️</div>
-          <div style={{flex:1}}><div style={{color:"#f87171",fontWeight:700,fontSize:14}}>Reset App Data</div><div style={{color:C.muted,fontSize:11,marginTop:1}}>Permanently clear all records from Drive</div></div>
+          <div style={{flex:1}}><div style={{color:"#f87171",fontWeight:700,fontSize:14}}>Reset App Data</div><div style={{color:C.muted,fontSize:11,marginTop:1}}>Permanently clear all local and server records</div></div>
           <div style={{color:C.muted,fontSize:14,fontWeight:700}}>{confirmReset?"▲":"▼"}</div>
         </button>
         {confirmReset&&(
@@ -1414,80 +1457,22 @@ function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut,showFla
 }
 
 /* ═══════════════════════════════════════════════════════════
-   AUTH / SETUP SCREENS
+   DEVICE SETUP SCREEN
+   One-time setup: just give this device a name.
+   No accounts, no internet required.
    ═══════════════════════════════════════════════════════════ */
-function ClientIdSetup({onSave}){
-  const[id,setId]=useState('');
+function DeviceSetup({onReady}){
+  const[name,setName]=useState('');
   return(
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:C.bg,color:C.text,padding:"24px",textAlign:"center"}}>
       <div style={{fontSize:"2.5rem",marginBottom:12}}>⚡</div>
       <h1 style={{fontWeight:800,fontSize:"1.5rem",marginBottom:8,color:C.green}}>FND Tracker</h1>
-      <p style={{color:C.muted,fontSize:13,marginBottom:24,lineHeight:1.6,maxWidth:340}}>One-time setup. You need a free Google Cloud OAuth Client ID to enable Drive sync.</p>
-      <div style={{width:"100%",maxWidth:380}}>
-        <div style={{background:"#0a1628",border:"1px solid #1e3a5f",borderRadius:12,padding:"12px 14px",fontSize:13,color:C.muted,lineHeight:1.6,marginBottom:16,textAlign:"left"}}>
-          <strong style={{color:"#93c5fd"}}>How to get your Client ID (5 min):</strong><br/>
-          1. Go to console.cloud.google.com<br/>
-          2. Create project → Enable Google Drive API<br/>
-          3. OAuth consent screen → External<br/>
-          4. Credentials → OAuth client ID → Web app<br/>
-          5. Add your site URL to Authorised JavaScript origins<br/>
-          6. Copy the Client ID (ends in .apps.googleusercontent.com)
-        </div>
-        <input style={{...IS,marginBottom:12,fontFamily:"monospace",fontSize:12}} placeholder="Paste Client ID here…" value={id} onChange={e=>setId(e.target.value.trim())}/>
-        <Btn onClick={()=>{localStorage.setItem('fnd_google_client_id',id);onSave(id);}} fullWidth disabled={!id.includes('googleusercontent')}>Save & Continue →</Btn>
+      <p style={{color:C.muted,fontSize:13,marginBottom:6,lineHeight:1.6,maxWidth:340}}>Give this device a name so entries are labelled correctly when syncing between devices.</p>
+      <p style={{color:"#374151",fontSize:12,marginBottom:24,maxWidth:320}}>The server must be running on the same network — open the URL it printed at startup.</p>
+      <div style={{width:"100%",maxWidth:360}}>
+        <FInput label="Device / Person Name" placeholder="e.g. Sarah's Phone, Caregiver Tablet…" value={name} onChange={e=>setName(e.target.value)} autoFocus/>
+        <Btn onClick={()=>{const n=name.trim();if(!n)return;localStorage.setItem('fnd_device_name',n);onReady(n);}} fullWidth disabled={!name.trim()}>Start →</Btn>
       </div>
-    </div>
-  );
-}
-
-function AuthScreen({clientId,onToken}){
-  const[loading,setLoading]=useState(false);
-  const[error,setError]=useState(null);
-
-  function signIn(){
-    setLoading(true); setError(null);
-    // Load GSI dynamically — only when user explicitly taps the button
-    // This prevents any automatic sign-in behaviour on app open
-    const doSignIn=()=>{
-      try{
-        window.google.accounts.oauth2.initTokenClient({
-          client_id:clientId,
-          scope:'https://www.googleapis.com/auth/drive.file openid email profile',
-          callback:(resp)=>{
-            setLoading(false);
-            if(resp?.access_token){ onToken(resp.access_token); }
-            else{ setError('Sign-in cancelled. Try again.'); }
-          }
-        }).requestAccessToken();
-      }catch(e){ setLoading(false); setError(e.message); }
-    };
-
-    if(window.google?.accounts?.oauth2){
-      doSignIn();
-    } else {
-      const s=document.createElement('script');
-      s.src='https://accounts.google.com/gsi/client';
-      s.onload=doSignIn;
-      s.onerror=()=>{ setLoading(false); setError('Could not load Google sign-in. Check your connection.'); };
-      document.head.appendChild(s);
-    }
-  }
-
-  return(
-    <div style={{display:'flex',flexDirection:'column',alignItems:'center',justifyContent:'center',minHeight:'100vh',background:C.bg,color:C.text,padding:'32px 24px',textAlign:'center'}}>
-      <div style={{fontSize:'3rem',marginBottom:12}}>⚡</div>
-      <h1 style={{fontWeight:800,fontSize:'1.6rem',marginBottom:8,color:C.green,letterSpacing:-0.5}}>FND Tracker</h1>
-      <p style={{color:C.muted,fontSize:14,marginBottom:32,lineHeight:1.6}}>Sign in once to connect your Google Drive.<br/>After that the app works offline.</p>
-      <button onClick={signIn} disabled={loading} style={{display:'flex',alignItems:'center',justifyContent:'center',gap:10,padding:'14px 24px',borderRadius:12,border:`1.5px solid ${C.border}`,background:C.card,color:C.text,fontFamily:'inherit',fontSize:15,fontWeight:600,cursor:loading?'not-allowed':'pointer',minWidth:260,minHeight:52,opacity:loading?0.6:1}}>
-        <svg width="20" height="20" viewBox="0 0 24 24">
-          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
-          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
-          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
-          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
-        </svg>
-        {loading?'Connecting…':'Continue with Google'}
-      </button>
-      {error&&<div style={{color:C.red,fontSize:13,marginTop:12,padding:'8px 14px',background:'#450a0a',borderRadius:8,maxWidth:320}}>{error}</div>}
     </div>
   );
 }
@@ -1499,19 +1484,15 @@ function App(){
   const cf=useChartFont();
   const desk=useDesktop();
 
-  // ── Drive state ──────────────────────────────────────────
-  const[clientId,setClientId]=useState(localStorage.getItem('fnd_google_client_id')||'');
-  const[token,setToken]=useState(null);           // Drive API token — null when offline/expired
-  const[userInfo,setUserInfo]=useState(loadSession); // load persisted session immediately
-  const[fileId,setFileId]=useState(localStorage.getItem('fnd_file_id')||null);
-  const[driveInstance,setDriveInstance]=useState(null);
-  // authStatus: 'boot' → check local → 'ready' (offline) or go get token → 'ready' (online)
-  const[authStatus,setAuthStatus]=useState('boot');
-  const[syncStatus,setSyncStatus]=useState('synced');
+  // ── Device identity ─────────────────────────────────────
+  const[deviceName,setDeviceName]=useState(()=>localStorage.getItem('fnd_device_name')||'');
+  const[appReady,setAppReady]=useState(()=>!!localStorage.getItem('fnd_device_name'));
+
+  // ── Sync state ──────────────────────────────────────────
+  const[syncStatus,setSyncStatus]=useState('offline');
   const[lastSynced,setLastSynced]=useState(null);
-  const[offlineCount,setOfflineCount]=useState(loadQueue().length);
-  const isSyncing=useRef(false);
-  const syncTimer=useRef(null);
+  const[connectedDevices,setConnectedDevices]=useState([]);
+  const syncRef=useRef(null);
 
   // ── App data — pre-populate from local snapshot if available ─
   const _snap = loadLocalSnapshot();
@@ -1530,269 +1511,102 @@ function App(){
 
   const showFlash=(msg,color=C.green)=>{setFlash({msg,color});setTimeout(()=>setFlash(null),2500);};
 
-  // ═══════════════════════════════════════════════════════════
-  // AUTH — SIMPLE SESSION MODEL
-  // ═══════════════════════════════════════════════════════════
-  // "Logged in" means: fnd_session exists in localStorage.
-  // That's it. No token, no network, no Google needed to open the app.
-  //
-  // Drive token is acquired LAZILY — only when a sync is actually
-  // attempted and we're online. It is never requested at boot.
-  // ═══════════════════════════════════════════════════════════
-
-  const fileIdRef      = useRef(localStorage.getItem('fnd_file_id')||null);
-  const driveRef       = useRef(null);   // current DriveSync instance
-  const syncToDriveRef = useRef(null);   // set after syncToDrive is defined
-  useEffect(()=>{ fileIdRef.current = fileId; }, [fileId]);
-
-  // ── Boot: purely from localStorage, zero network ──────────
+  // ── Boot: remove loader immediately (data already in state from snapshot) ──
   useEffect(()=>{
-    const session = loadSession();
-    const snap    = loadLocalSnapshot();
-    if(session){
-      setUserInfo(session);
-      if(snap){
-        // Populate state from snapshot
-        setEvents((snap.events||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-        setPending((snap.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-        setMeds((snap.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-        setFood((snap.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-        setMedLib(snap.medLib||[]);
-        setFoodLib(snap.foodLib||[]);
-        setCheckins((snap.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      }
-      setAuthStatus('ready');
-      setSyncStatus(navigator.onLine?'stale':'offline');
-    } else {
-      setAuthStatus('needs-login');
-    }
     document.getElementById('root-loader')?.remove();
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
-  // ── syncWithDrive: sync to Drive using the existing token ─
-  // Never requests a new token. If no drive instance exists,
-  // sets syncStatus='needs-reauth' so the UI shows a button.
-  // This function will NEVER open a browser tab or touch Google auth.
-  const syncWithDrive = useCallback(async (localState)=>{
-    if(!navigator.onLine){ setSyncStatus('offline'); return; }
-    if(isSyncing.current) return;
-    if(!driveRef.current){ setSyncStatus('needs-reauth'); return; }
-
-    isSyncing.current=true; setSyncStatus('saving');
-    try{
-      const drive = driveRef.current;
-      let fid = fileIdRef.current;
-      if(!fid){
-        const result = await drive.init();
-        fid=result.fileId;
-        localStorage.setItem('fnd_file_id',fid);
-        setFileId(fid); fileIdRef.current=fid;
-        if(result.isNew) showFlash('New data file created in Drive 🎉');
-      }
-
-      let remote;
-      try{ remote = await drive.readFile(fid); }
-      catch(e){
-        // Token expired — clear and flag for manual re-auth
-        driveRef.current=null; setDriveInstance(null);
-        setSyncStatus('needs-reauth');
-        return;
-      }
-
-      const byId=x=>x.id;
-      const mergeInto=(local,rem)=>{
-        const ids=new Set(local.map(byId));
-        return [...local,...rem.filter(x=>x&&!ids.has(byId(x)))];
+  // ── Process incoming server data ───────────────────────────
+  const applyServerData = useCallback((payload, mode) => {
+    const byTs = (a,b) => new Date(b.timestamp) - new Date(a.timestamp);
+    if (mode === 'full') {
+      const merge = (local, remote) => {
+        const ids = new Set(local.map(x => x.id));
+        return [...local, ...remote.filter(x => x && !ids.has(x.id))];
       };
-      const q=loadQueue();
-      const qEvts=q.filter(x=>!x._type);
-      const merged={
-        events:   mergeInto(localState.events||[]  ,[...(remote.events||[]),...qEvts]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        pending:  [...(localState.pending||[])],
-        meds:     mergeInto(localState.meds||[]    ,remote.meds||[]    ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        food:     mergeInto(localState.food||[]    ,remote.food||[]    ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        medLib:   mergeInto(localState.medLib||[]  ,remote.medLib||[]  ),
-        foodLib:  mergeInto(localState.foodLib||[] ,remote.foodLib||[] ),
-        checkins: mergeInto(localState.checkins||[],
-                    (remote.checkins||[]).concat(q.filter(x=>x._type==='checkin'))
-                  ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        version:1, lastModified:new Date().toISOString()
-      };
-
-      await drive.writeFile(fid,merged);
-      clearQueue(); setOfflineCount(0);
-      setEvents(merged.events); setPending(merged.pending);
-      setMeds(merged.meds); setFood(merged.food);
-      setMedLib(merged.medLib); setFoodLib(merged.foodLib);
-      setCheckins(merged.checkins);
-      saveLocalSnapshot(merged);
+      setEvents(ev  => merge(ev,  payload.events   ||[]).sort(byTs));
+      setMeds(m     => merge(m,   payload.meds     ||[]).sort(byTs));
+      setFood(f     => merge(f,   payload.food     ||[]).sort(byTs));
+      setCheckins(c => merge(c,   payload.checkins ||[]).sort(byTs));
       setLastSynced(new Date().toISOString());
-      setSyncStatus('synced');
-    }catch(e){
-      driveRef.current=null; setDriveInstance(null);
-      setSyncStatus('needs-reauth');
-    }
-    finally{ isSyncing.current=false; }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[]);
-
-  // Keep syncToDriveRef current
-  useEffect(()=>{ syncToDriveRef.current = syncWithDrive; },[syncWithDrive]);
-
-  // ── Token handler: sign-in button ─────────────────────────
-  const handleToken = useCallback(async (accessToken)=>{
-    const drive = new DriveSync(accessToken);
-    driveRef.current=drive; setToken(accessToken); setDriveInstance(drive);
-    try{
-      // Priority order for finding the file:
-      // 1. Stored file ID from a previous session (most reliable)
-      // 2. Manually entered shared file ID (for caregiver's device)
-      // 3. Search Drive by filename (finds own + shared files)
-      // 4. Create a new file (only if nothing found)
-      let fid = fileIdRef.current || localStorage.getItem(SHARED_FILE_KEY) || null;
-      let data;
-
-      if(fid){
-        try{
-          data = await drive.readFile(fid);
-          localStorage.setItem('fnd_file_id', fid);
-          setFileId(fid); fileIdRef.current=fid;
-        }catch(e){
-          // File ID didn't work — clear only the cached ID, keep shared ID for next attempt
-          localStorage.removeItem('fnd_file_id');
-          fileIdRef.current=null; fid=null;
+    } else if (mode === 'patch') {
+      for (const change of payload) {
+        if (change._delete) {
+          const rmId = change.id;
+          setEvents(ev  => ev.filter(x => x.id !== rmId));
+          setMeds(m     => m.filter(x => x.id !== rmId));
+          setFood(f     => f.filter(x => x.id !== rmId));
+          setCheckins(c => c.filter(x => x.id !== rmId));
+          setPending(p  => p.filter(x => x.id !== rmId));
+          continue;
         }
+        const upsert = (setter) => setter(arr => {
+          if (arr.some(x => x.id === change.id))
+            return arr.map(x => x.id === change.id ? change : x).sort(byTs);
+          return [change, ...arr].sort(byTs);
+        });
+        if (change._type === 'event')   upsert(setEvents);
+        else if (change._type === 'med')   upsert(setMeds);
+        else if (change._type === 'food')  upsert(setFood);
+        else if (change._type === 'checkin') upsert(setCheckins);
       }
+    }
+  }, []);
 
-      if(!fid){
-        const result = await drive.init(); // searches then creates if not found
-        fid=result.fileId; data=result.data;
-        localStorage.setItem('fnd_file_id',fid);
-        setFileId(fid); fileIdRef.current=fid;
-        if(result.isNew) showFlash('New data file created in Drive 🎉');
-      }
-
-      const q=loadQueue(); const qEvts=q.filter(x=>!x._type); const byId=x=>x.id;
-      const snap={
-        events:mergeByKey(data.events||[],qEvts,byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        pending:(data.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        meds:(data.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        food:(data.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        medLib:data.medLib||[], foodLib:data.foodLib||[],
-        checkins:(data.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp))
-      };
-      setEvents(snap.events); setPending(snap.pending); setMeds(snap.meds);
-      setFood(snap.food); setMedLib(snap.medLib); setFoodLib(snap.foodLib); setCheckins(snap.checkins);
-      saveLocalSnapshot(snap);
-      if(qEvts.length) drive.writeFile(fid,{...data,events:snap.events}).then(()=>clearQueue()).catch(()=>{});
-      setLastSynced(new Date().toISOString());
-      setSyncStatus('synced');
-    }catch(e){ setSyncStatus('offline'); }
-
-    let sessionInfo = {name:'User', email:'', picture:''};
-    try{
-      const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo',
-        {headers:{Authorization:`Bearer ${accessToken}`}});
-      if(r.ok) sessionInfo = await r.json();
-    }catch(e){}
-    setUserInfo(sessionInfo);
-    saveSession(sessionInfo);
-    setAuthStatus('ready');
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[]);
-
-  // ── Online: trigger sync when connection restored ──────────
-  useEffect(()=>{
-    const onOnline=()=>{
-      setSyncStatus('stale');
-      // Trigger a sync using current state
-      setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-        if(syncToDriveRef.current)
-          syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
-        return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
-    };
-    const onOffline=()=>setSyncStatus('offline');
-    window.addEventListener('online',onOnline);
-    window.addEventListener('offline',onOffline);
-    return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);};
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[]);
-
-  // ── Visibility: sync when app comes to foreground ─────────
-  useEffect(()=>{
-    if(authStatus!=='ready') return;
-    const onVisible=()=>{
-      if(document.visibilityState!=='visible'||!navigator.onLine) return;
-      setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-        if(syncToDriveRef.current)
-          syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
-        return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
-    };
-    document.addEventListener('visibilitychange',onVisible);
-    return()=>document.removeEventListener('visibilitychange',onVisible);
-  },[authStatus]);
-
-  // ── scheduleSync: save locally then sync to Drive ─────────
-  // Always saves to localStorage first (offline safety).
-  // Drive sync is attempted after 2s debounce, only when online.
-  const scheduleSync=useCallback((explicitState)=>{
-    clearTimeout(syncTimer.current);
-    if(explicitState) saveLocalSnapshot(explicitState);
-    setSyncStatus(navigator.onLine?'stale':'offline');
-    syncTimer.current=setTimeout(()=>{
-      if(explicitState){
-        syncWithDrive(explicitState);
-      }else{
-        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-          const s={events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci};
-          saveLocalSnapshot(s);
-          syncWithDrive(s);
-          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
-      }
-    },2000);
-  },[syncWithDrive]);
+  // ── Initialise sync engine once device is named ────────────
+  useEffect(() => {
+    if (!appReady) return;
+    const sync = new ServerSync({
+      onData: applyServerData,
+      onStatus: s => { setSyncStatus(s); if (s === 'synced') setLastSynced(new Date().toISOString()); },
+      onDevices: setConnectedDevices,
+    });
+    syncRef.current = sync;
+    return () => { try { sync.ws?.close(); } catch {} };
+  }, [appReady, applyServerData]);
 
   // ── Data mutation helpers ─────────────────────────────────
-  const addEvent=e=>{const n=[e,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(n);scheduleSync({events:n,pending,meds,food,medLib,foodLib,checkins});showFlash("⚡ Event logged");};
-  const addMed=e=>{const n=[e,...meds].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setMeds(n);scheduleSync({events,pending,meds:n,food,medLib,foodLib,checkins});showFlash("💊 Medication logged",C.purple);};
-  const addFood=e=>{const n=[e,...food].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setFood(n);scheduleSync({events,pending,meds,food:n,medLib,foodLib,checkins});showFlash("🍽 Meal logged",C.teal);};
-  const addCheckin=async c=>{const n=[c,...checkins];setCheckins(n);scheduleSync({events,pending,meds,food,medLib,foodLib,checkins:n});showFlash("✓ Check-in saved");};
-  const delEvent=id=>{const n=events.filter(e=>e.id!==id);setEvents(n);scheduleSync({events:n,pending,meds,food,medLib,foodLib,checkins});};
-  const delPending=id=>{const n=pending.filter(e=>e.id!==id);setPending(n);scheduleSync({events,pending:n,meds,food,medLib,foodLib,checkins});};
-  const delMed=id=>{const n=meds.filter(e=>e.id!==id);setMeds(n);scheduleSync({events,pending,meds:n,food,medLib,foodLib,checkins});};
-  const delFood=id=>{const n=food.filter(e=>e.id!==id);setFood(n);scheduleSync({events,pending,meds,food:n,medLib,foodLib,checkins});};
-  const saveMedLib=lib=>{const clean=(lib||[]).filter(Boolean);setMedLib(clean);scheduleSync({events,pending,meds,food,medLib:clean,foodLib,checkins});};
-  const saveFoodLib=lib=>{const clean=(lib||[]).filter(Boolean);setFoodLib(clean);scheduleSync({events,pending,meds,food,medLib,foodLib:clean,checkins});};
+  // Each helper: (1) updates local state immediately, (2) saves snapshot
+  // for offline resilience, (3) pushes the change to the server.
+  const snap=()=>({events,pending,meds,food,medLib,foodLib,checkins});
+  const byTs=(a,b)=>new Date(b.timestamp)-new Date(a.timestamp);
+
+  const addEvent=e=>{const n=[e,...events].sort(byTs);setEvents(n);saveLocalSnapshot({...snap(),events:n});syncRef.current?.push({...e,_type:'event'});showFlash("⚡ Event logged");};
+  const addMed=e=>{const n=[e,...meds].sort(byTs);setMeds(n);saveLocalSnapshot({...snap(),meds:n});syncRef.current?.push({...e,_type:'med'});showFlash("💊 Medication logged",C.purple);};
+  const addFood=e=>{const n=[e,...food].sort(byTs);setFood(n);saveLocalSnapshot({...snap(),food:n});syncRef.current?.push({...e,_type:'food'});showFlash("🍽 Meal logged",C.teal);};
+  const addCheckin=async c=>{const n=[c,...checkins];setCheckins(n);saveLocalSnapshot({...snap(),checkins:n});syncRef.current?.push({...c,_type:'checkin'});showFlash("✓ Check-in saved");};
+  const delEvent=id=>{const n=events.filter(e=>e.id!==id);setEvents(n);saveLocalSnapshot({...snap(),events:n});syncRef.current?.pushDelete(id);};
+  const delPending=id=>{const n=pending.filter(e=>e.id!==id);setPending(n);syncRef.current?.pushDelete(id);};
+  const delMed=id=>{const n=meds.filter(e=>e.id!==id);setMeds(n);saveLocalSnapshot({...snap(),meds:n});syncRef.current?.pushDelete(id);};
+  const delFood=id=>{const n=food.filter(e=>e.id!==id);setFood(n);saveLocalSnapshot({...snap(),food:n});syncRef.current?.pushDelete(id);};
+  const saveMedLib=lib=>{const clean=(lib||[]).filter(Boolean);setMedLib(clean);saveLocalSnapshot({...snap(),medLib:clean});};
+  const saveFoodLib=lib=>{const clean=(lib||[]).filter(Boolean);setFoodLib(clean);saveLocalSnapshot({...snap(),foodLib:clean});};
   const updateEvent=updated=>{
     const np=pending.filter(e=>e.id!==updated.id);
-    const ne=[updated,...events.filter(e=>e.id!==updated.id)].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+    const ne=[updated,...events.filter(e=>e.id!==updated.id)].sort(byTs);
     setPending(np);setEvents(ne);setEditing(null);
-    scheduleSync({events:ne,pending:np,meds,food,medLib,foodLib,checkins});
+    saveLocalSnapshot({...snap(),events:ne,pending:np});
+    syncRef.current?.push({...updated,_type:'event'});
     showFlash("✅ Event updated");
   };
-  const updateMed=updated=>{const n=meds.map(e=>e.id===updated.id?updated:e).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setMeds(n);setEditing(null);scheduleSync({events,pending,meds:n,food,medLib,foodLib,checkins});showFlash("✅ Medication updated",C.purple);};
-  const updateFood=updated=>{const n=food.map(e=>e.id===updated.id?updated:e).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setFood(n);setEditing(null);scheduleSync({events,pending,meds,food:n,medLib,foodLib,checkins});showFlash("✅ Meal updated",C.teal);};
+  const updateMed=updated=>{const n=meds.map(e=>e.id===updated.id?updated:e).sort(byTs);setMeds(n);setEditing(null);saveLocalSnapshot({...snap(),meds:n});syncRef.current?.push({...updated,_type:'med'});showFlash("✅ Medication updated",C.purple);};
+  const updateFood=updated=>{const n=food.map(e=>e.id===updated.id?updated:e).sort(byTs);setFood(n);setEditing(null);saveLocalSnapshot({...snap(),food:n});syncRef.current?.push({...updated,_type:'food'});showFlash("✅ Meal updated",C.teal);};
 
   const quickLog=()=>{
-    const e={id:uid(),timestamp:nowISO(),pending:true};
-    if(!navigator.onLine){
-      const q=loadQueue();q.push(e);saveQueue(q);setOfflineCount(q.length);
-      const np=[e,...pending];setPending(np);
-      showFlash("⚡ Timestamped (offline)",C.amber);
-    }else{
-      const np=[e,...pending];setPending(np);
-      scheduleSync({events,pending:np,meds,food,medLib,foodLib,checkins});
-      showFlash("⚡ Event timestamped!");
-    }
+    const e={id:uid(),timestamp:nowISO(),pending:true,userName:deviceName};
+    const np=[e,...pending];setPending(np);
+    saveLocalSnapshot({...snap(),pending:np});
+    syncRef.current?.push({...e,_type:'event'});
+    showFlash(syncRef.current?.connected?"⚡ Event timestamped!":"⚡ Timestamped (queued)",syncRef.current?.connected?C.green:C.amber);
   };
   const openReview=()=>{setRevIdx(0);setModal("review");};
   const handleReviewSave=details=>{
     const saved={...pending[revIdx],...details,pending:false};
-    const ne=[saved,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+    const ne=[saved,...events.filter(e=>e.id!==saved.id)].sort(byTs);
     const np=pending.filter((_,i)=>i!==revIdx);
     setEvents(ne);setPending(np);
-    scheduleSync({events:ne,pending:np,meds,food,medLib,foodLib,checkins});
+    saveLocalSnapshot({...snap(),events:ne,pending:np});
+    syncRef.current?.push({...saved,_type:'event'});
     if(!np.length){setModal(null);showFlash("✅ All events reviewed!");}
     else setRevIdx(i=>Math.min(i,np.length-1));
   };
@@ -1804,82 +1618,43 @@ function App(){
   };
   const approveAll=()=>{
     const approved=pending.map(e=>({...e,pending:false}));
-    const ne=[...approved,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+    const ne=[...approved,...events].sort(byTs);
     setEvents(ne);setPending([]);
-    scheduleSync({events:ne,pending:[],meds,food,medLib,foodLib,checkins});
+    saveLocalSnapshot({...snap(),events:ne,pending:[]});
+    approved.forEach(e=>syncRef.current?.push({...e,_type:'event'}));
     showFlash(`✅ Approved ${approved.length} event${approved.length!==1?"s":""}!`);
   };
   const resetApp=()=>{
     setEvents([]);setPending([]);setMeds([]);setFood([]);setMedLib([]);setFoodLib([]);setCheckins([]);
-    scheduleSync({events:[],pending:[],meds:[],food:[],medLib:[],foodLib:[],checkins:[]});
-    showFlash("🗑 All data cleared",C.amber);
+    saveLocalSnapshot({events:[],pending:[],meds:[],food:[],medLib:[],foodLib:[],checkins:[]});
+    showFlash("🗑 All local data cleared",C.amber);
   };
   const handleImport=(imported,mode)=>{
-    // Use ID-based dedup — timestamp-based keys falsely flag records as duplicates
     const byId=e=>e.id;
     const dedup=(existing,incoming)=>{const ids=new Set(existing.map(byId));return[...existing,...incoming.filter(e=>e&&!ids.has(byId(e)))];};
     if(mode==="replace"){
       const ne=imported.events||[];const nm=imported.meds||[];const nf=imported.food||[];
-      setEvents(ne.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      setMeds(nm.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      setFood(nf.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      scheduleSync({events:ne,pending:[],meds:nm,food:nf,medLib,foodLib,checkins});showFlash(`✅ Replaced with ${ne.length} events, ${nm.length} meds, ${nf.length} meals`);
+      setEvents(ne.sort(byTs));setMeds(nm.sort(byTs));setFood(nf.sort(byTs));
+      saveLocalSnapshot({events:ne,pending:[],meds:nm,food:nf,medLib,foodLib,checkins});
+      ne.forEach(e=>syncRef.current?.push({...e,_type:'event'}));
+      nm.forEach(m=>syncRef.current?.push({...m,_type:'med'}));
+      nf.forEach(f=>syncRef.current?.push({...f,_type:'food'}));
+      showFlash(`✅ Replaced with ${ne.length} events, ${nm.length} meds, ${nf.length} meals`);
     }else{
-      const ne=dedup(events,imported.events||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
-      const nm=dedup(meds,imported.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
-      const nf=dedup(food,imported.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      const ne=dedup(events,imported.events||[]).sort(byTs);
+      const nm=dedup(meds,imported.meds||[]).sort(byTs);
+      const nf=dedup(food,imported.food||[]).sort(byTs);
       setEvents(ne);setMeds(nm);setFood(nf);
       const added=(ne.length-events.length)+(nm.length-meds.length)+(nf.length-food.length);
-      scheduleSync({events:ne,pending,meds:nm,food:nf,medLib,foodLib,checkins});showFlash(`✅ Merged — ${added} new record${added!==1?"s":""} added`);
+      saveLocalSnapshot({...snap(),events:ne,meds:nm,food:nf});
+      ne.filter(e=>!events.some(x=>x.id===e.id)).forEach(e=>syncRef.current?.push({...e,_type:'event'}));
+      nm.filter(m=>!meds.some(x=>x.id===m.id)).forEach(m=>syncRef.current?.push({...m,_type:'med'}));
+      nf.filter(f=>!food.some(x=>x.id===f.id)).forEach(f=>syncRef.current?.push({...f,_type:'food'}));
+      showFlash(`✅ Merged — ${added} new record${added!==1?"s":""} added`);
     }
   };
-  const signOut=()=>{
-    // Revoke token if available (best-effort, non-blocking)
-    if(token){
-      try{
-        if(window.google?.accounts?.oauth2) window.google.accounts.oauth2.revoke(token,()=>{});
-      }catch(e){}
-    }
-    // Clear all local state — this is what actually signs out
-    clearSession();
-    // Keep fnd_file_id and fnd_shared_file_id so next sign-in finds the same file
-    window.location.reload();
-  };
-
-  const manualSync=()=>{
-    if(!driveRef.current){
-      // No drive token — ask user to reconnect
-      if(!navigator.onLine){ showFlash('No connection',C.amber); return; }
-      // Load GSI dynamically (same as sign-in) then get a token
-      const doReauth=()=>{
-        try{
-          window.google.accounts.oauth2.initTokenClient({
-            client_id:clientId,
-            scope:'https://www.googleapis.com/auth/drive.file openid email profile',
-            callback:(resp)=>{
-              if(resp?.access_token){
-                const drive=new DriveSync(resp.access_token);
-                driveRef.current=drive; setToken(resp.access_token); setDriveInstance(drive);
-                setSyncStatus('stale');
-                syncWithDrive({events,pending,meds,food,medLib,foodLib,checkins});
-                showFlash('Drive reconnected ✓');
-              }else{ showFlash('Could not reconnect',C.red); }
-            }
-          }).requestAccessToken();
-        }catch(e){ showFlash('Could not reconnect',C.red); }
-      };
-      if(window.google?.accounts?.oauth2){ doReauth(); }
-      else{
-        const s=document.createElement('script');
-        s.src='https://accounts.google.com/gsi/client';
-        s.onload=doReauth;
-        document.head.appendChild(s);
-      }
-      return;
-    }
-    syncWithDrive({events,pending,meds,food,medLib,foodLib,checkins})
-      .then(()=>showFlash('☁️ Synced ✓'));
-  };
+  const handleRenameDevice=name=>{setDeviceName(name);syncRef.current?.setDeviceName(name);};
+  const manualSync=()=>syncRef.current?.fetchFull()||showFlash('Reconnecting…',C.amber);
 
   // ── Computed ──────────────────────────────────────────────
   const todayEvents=filterFrom(events,startOf("day"));
@@ -1896,21 +1671,14 @@ function App(){
   const reviewing=modal==="review"&&pending[revIdx];
 
   // ── Render gate ───────────────────────────────────────────
-  // boot   = reading localStorage (very brief, no flicker)
-  // needs-login = no session stored, show sign-in
-  // ready  = show the app (works online and offline)
-  if(!clientId)return <ClientIdSetup onSave={setClientId}/>;
-  if(authStatus==='boot')return(
-    <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",color:C.green,gap:12,background:C.bg}}>
-      <div style={{fontSize:"2rem"}}>⚡</div>
-      <div style={{fontWeight:700}}>FND Tracker</div>
-    </div>
-  );
-  if(authStatus==='needs-login')return <AuthScreen clientId={clientId} onToken={handleToken}/>;
+  // Show DeviceSetup on first launch (no device name stored yet)
+  if(!appReady) return <DeviceSetup onReady={name=>{setDeviceName(name);setAppReady(true);}}/>;
 
   // ── Sync status label ─────────────────────────────────────
-  const syncLabel=syncStatus==='saving'?'Saving…':syncStatus==='needs-reauth'?'Tap to reconnect':syncStatus==='offline'&&offlineCount>0?`${offlineCount} queued`:syncStatus==='offline'?'Offline':syncStatus==='stale'?'Pending':syncStatus==='error'?'Sync error':'☁️ Drive';
-  const syncColor=syncStatus==='needs-reauth'?C.amber:syncStatus==='error'?C.red:syncStatus==='offline'?C.amber:syncStatus==='synced'?C.green:C.sub;
+  const queueLen=syncRef.current?.queue?.length||0;
+  const syncLabel=syncStatus==='saving'?'Saving…':syncStatus==='connecting'?'Connecting…':syncStatus==='offline'&&queueLen>0?`${queueLen} queued`:syncStatus==='offline'?'Offline':'✓ Synced';
+  const syncColor=syncStatus==='offline'?C.amber:syncStatus==='synced'?C.green:C.sub;
+  const userInfo={name:deviceName,email:''};
 
   // ── HOME CONTENT ──────────────────────────────────────────
   const pad2=n=>String(n).padStart(2,'0');
@@ -1993,9 +1761,9 @@ function App(){
         <div style={{background:streak>0?"#052e16":C.card,border:`1px solid ${streak>0?C.green:C.border}`,borderRadius:12,padding:"14px 16px"}}><div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>{streak>0?"Streak":"Clear Days (30d)"}</div><div style={{color:streak>0?C.green:C.teal,fontSize:desk?32:22,fontWeight:800,lineHeight:1}}>{streak>0?`${streak}d`:clearDays30}</div><div style={{color:C.muted,fontSize:11,marginTop:4}}>{streak>0?"seizure-free 🌙":"days without events"}</div></div>
         {/* Sync status tile */}
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"14px 16px",cursor:"pointer"}} onClick={manualSync}>
-          <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Drive Sync</div>
+          <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Server Sync</div>
           <div style={{color:syncColor,fontSize:desk?20:16,fontWeight:800,lineHeight:1.2}}>{syncLabel}</div>
-          <div style={{color:C.muted,fontSize:11,marginTop:4}}>{lastSynced?`Last: ${fmtTime(lastSynced)}`:"Tap to sync"}</div>
+          <div style={{color:C.muted,fontSize:11,marginTop:4}}>{connectedDevices.length>0?`${connectedDevices.length} device${connectedDevices.length!==1?'s':''} online`:lastSynced?`Last: ${fmtTime(lastSynced)}`:"Tap to refresh"}</div>
         </div>
       </div>
     </div>
@@ -2007,7 +1775,7 @@ function App(){
       {tab==="home"&&homeContent}
       {tab==="trends"&&<TrendsTab events={events} food={food}/>}
       {tab==="log"&&<LogTab events={events} pending={pending} meds={meds} food={food} delEvent={delEvent} delPending={delPending} delMed={delMed} delFood={delFood} setEditing={setEditing} approveAll={approveAll}/>}
-      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} onImport={handleImport} userInfo={userInfo} onSignOut={signOut} showFlash={showFlash}/>}
+      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} onImport={handleImport} deviceName={deviceName} onRenameDevice={handleRenameDevice} showFlash={showFlash}/>}
     </>
   );
 
@@ -2079,8 +1847,9 @@ function App(){
         </div>
         <div style={{padding:"10px 18px 20px",borderTop:`1px solid ${C.border}`}}>
           <button onClick={manualSync} style={{width:"100%",background:"none",border:`1px solid ${C.border}`,borderRadius:8,padding:"7px 12px",cursor:"pointer",display:"flex",alignItems:"center",gap:8,color:syncColor,fontSize:12,fontWeight:600}}>
-            <span>☁️</span><span style={{flex:1}}>{syncLabel}</span>
+            <span>{syncStatus==='synced'?'✓':'⏳'}</span><span style={{flex:1}}>{syncLabel}</span>
           </button>
+          {connectedDevices.length>0&&<div style={{color:C.muted,fontSize:10,textAlign:"center",marginTop:5}}>{connectedDevices.map(d=>d.name||d.id).join(' · ')}</div>}
         </div>
       </aside>
       <main style={{marginLeft:SIDEBAR_W,flex:1,minHeight:"100vh"}}>
@@ -2107,7 +1876,7 @@ function App(){
         <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:10,padding:"6px 14px",textAlign:"center",cursor:"pointer"}} onClick={manualSync}>
           <div style={{color:C.green,fontSize:22,fontWeight:800,lineHeight:1}}>{todayEvents.length}</div>
           <div style={{color:C.muted,fontSize:10}}>today</div>
-          <div style={{color:syncColor,fontSize:9,marginTop:1}}>{syncLabel}</div>
+          <div style={{color:syncColor,fontSize:9,marginTop:1}}>{connectedDevices.length>0?`${connectedDevices.length} online`:syncLabel}</div>
         </div>
       </div>
       <div style={{padding:"14px 18px"}}>{tabContent}</div>

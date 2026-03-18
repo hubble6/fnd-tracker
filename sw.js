@@ -1,6 +1,7 @@
-// FND Tracker — Service Worker v5
-const CACHE = 'fnd-drive-v5';
+// FND Tracker — Service Worker v6 (local server, no Google Drive)
+const CACHE = 'fnd-local-v6';
 
+// Static app shell — cached on first install
 const SHELL = [
   './',
   './index.html',
@@ -23,7 +24,7 @@ self.addEventListener('install', e => {
 self.addEventListener('activate', e => {
   e.waitUntil(
     caches.keys()
-      .then(keys => Promise.all(keys.filter(k=>k!==CACHE).map(k=>caches.delete(k))))
+      .then(keys => Promise.all(keys.filter(k => k !== CACHE).map(k => caches.delete(k))))
       .then(() => self.clients.claim())
   );
 });
@@ -31,20 +32,30 @@ self.addEventListener('activate', e => {
 self.addEventListener('fetch', e => {
   const url = new URL(e.request.url);
 
-  // Never intercept Google Drive API or auth calls — they need real network
-  if (['googleapis.com','accounts.google.com','googleusercontent.com'].some(h=>url.hostname.includes(h))) return;
+  // Never intercept local API calls (/api/*) — always go to network
+  if (url.pathname.startsWith('/api/')) return;
 
+  // Never intercept WebSocket upgrades
+  if (e.request.headers.get('upgrade') === 'websocket') return;
+
+  // Only cache GET requests
   if (e.request.method !== 'GET') return;
 
-  // Cache-first for everything else (app shell, fonts, CDN scripts)
+  // Cache-first for app shell and CDN assets
   e.respondWith(
     caches.match(e.request).then(cached => {
       if (cached) return cached;
       return fetch(e.request).then(r => {
-        if (r?.status===200 && r.type!=='opaque') {
-          caches.open(CACHE).then(c=>c.put(e.request, r.clone()));
+        // Cache successful, non-opaque responses
+        if (r?.status === 200 && r.type !== 'opaque') {
+          caches.open(CACHE).then(c => c.put(e.request, r.clone()));
         }
         return r;
+      }).catch(() => {
+        // Network failed — for navigation requests serve cached index.html
+        if (e.request.mode === 'navigate') {
+          return caches.match('./index.html');
+        }
       });
     })
   );
