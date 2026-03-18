@@ -51,8 +51,14 @@ class DriveSync {
     return r;
   }
   async findFile() {
-    const r = await this.req(`https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name,modifiedTime)&spaces=drive`);
-    const d = await r.json(); return d.files?.[0] || null;
+    // Search own drive first
+    const r1 = await this.req(`https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name,modifiedTime)&spaces=drive`);
+    const d1 = await r1.json();
+    if(d1.files?.[0]) return d1.files[0];
+    // Also search sharedWithMe (for the caregiver's account)
+    const r2 = await this.req(`https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false and sharedWithMe=true&fields=files(id,name,modifiedTime)&spaces=drive`);
+    const d2 = await r2.json();
+    return d2.files?.[0] || null;
   }
   async createFile(data) {
     const form = new FormData();
