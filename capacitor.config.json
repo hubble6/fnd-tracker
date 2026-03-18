@@ -1,0 +1,14 @@
+{
+  "appId": "com.fndtracker.app",
+  "appName": "FND Tracker",
+  "webDir": ".",
+  "bundledWebRuntime": false,
+  "server": {
+    "androidScheme": "https"
+  },
+  "android": {
+    "allowMixedContent": false,
+    "captureInput": true,
+    "webContentsDebuggingEnabled": false
+  }
+}

@@ -1,7 +1,7 @@
 {
   "name": "FND Tracker",
   "short_name": "FND Tracker",
-  "description": "Daily symptom check-in for Functional Neurological Disorder — synced to Google Drive",
+  "description": "Daily symptom check-in for Functional Neurological Disorder — fully offline, no server needed",
   "start_url": "./",
   "display": "standalone",
   "background_color": "#0a0f1e",
