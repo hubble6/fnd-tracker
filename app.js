@@ -613,19 +613,23 @@ function TrendsTab({events,food}){
   const monthTrend=Array.from({length:8},(_,mi)=>{const ref=new Date();ref.setDate(1);ref.setMonth(ref.getMonth()-(offset+7-mi));const start=new Date(ref);start.setHours(0,0,0,0);const end=new Date(ref.getFullYear(),ref.getMonth()+1,0,23,59,59,999);return{cnt:events.filter(e=>{const t=new Date(e.timestamp);return t>=start&&t<=end;}).length,label:ref.toLocaleDateString([],{month:"short"})};});
   return(
     <div>
-      <div style={{display:"flex",gap:6,marginBottom:14}}>
-        {[[30,"30d"],[90,"90d"],[180,"6mo"],[365,"1yr"],[9999,"All"]].map(([d,l])=>(
-          <button key={d} onClick={()=>setWindow(d)} style={{flex:1,padding:"6px 0",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:700,background:window===d?C.greenDk:"#1e293b",color:window===d?C.green:C.muted,border:window===d?"1px solid #059669":`1px solid ${C.border}`}}>{l}</button>
-        ))}
-      </div>
+      {/* Section tabs — always visible */}
       <div style={{display:"flex",background:"#1e293b",borderRadius:10,padding:3,marginBottom:14,gap:3}}>
-        {sectionBtn("time","🕐 Time Analysis")}
+        {sectionBtn("time","🕐 Time")}
         {sectionBtn("weekly","📅 Weekly")}
         {sectionBtn("monthly","📆 Monthly")}
         {sectionBtn("food","🍽 Food")}
       </div>
+
+      {/* ── Time Analysis ── */}
       {section==="time"&&(
         <div>
+          {/* Window buttons nested here only */}
+          <div style={{display:"flex",gap:6,marginBottom:14}}>
+            {[[30,"30d"],[90,"90d"],[180,"6mo"],[365,"1yr"],[9999,"All"]].map(([d,l])=>(
+              <button key={d} onClick={()=>setWindow(d)} style={{flex:1,padding:"6px 0",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:700,background:window===d?C.greenDk:"#1e293b",color:window===d?C.green:C.muted,border:window===d?"1px solid #059669":`1px solid ${C.border}`}}>{l}</button>
+            ))}
+          </div>
           {insightParts.length>0&&(
             <div style={{background:"#0a1628",border:"1px solid #1e3a5f",borderRadius:12,padding:14,marginBottom:14}}>
               <div style={{color:"#93c5fd",fontSize:12,fontWeight:700,marginBottom:6}}>💡 Key Findings — last {window===9999?"all time":`${window} days`} ({evts.length} events)</div>
@@ -642,8 +646,11 @@ function TrendsTab({events,food}){
                 </div>
               );})}
             </div>
-            <div style={{display:"flex",gap:3}}>
+            <div style={{display:"flex",gap:3,marginBottom:10}}>
               {buckets.map((b,i)=><div key={i} style={{flex:1,textAlign:"center",fontSize:cf.axisLabel,color:b.startM===peak.startM?C.amber:C.muted,fontWeight:b.startM===peak.startM?700:400}}>{b.label}</div>)}
+            </div>
+            <div style={{color:C.muted,fontSize:11,lineHeight:1.6,borderTop:`1px solid ${C.border}`,paddingTop:10}}>
+              Peak window is <span style={{color:C.amber,fontWeight:700}}>{peak.label.replace('-',' – ')}</span> with {peak.count} event{peak.count!==1?"s":""} ({evts.length?Math.round(peak.count/evts.length*100):0}% of total). {evts.length>0&&`Across all ${evts.length} events in this period.`}
             </div>
           </div>
           <div style={cardStyle}>
@@ -656,11 +663,17 @@ function TrendsTab({events,food}){
                 </div>
               );})}
             </div>
-            <div style={{display:"flex",gap:4}}>{byDayOfWeek.map((d,i)=><div key={i} style={{flex:1,textAlign:"center",fontSize:cf.axisLabel,color:d.name===peakDay.name?C.amber:C.muted,fontWeight:d.name===peakDay.name?700:400}}>{d.name}</div>)}</div>
+            <div style={{display:"flex",gap:4,marginBottom:10}}>
+              {byDayOfWeek.map((d,i)=><div key={i} style={{flex:1,textAlign:"center",fontSize:cf.axisLabel,color:d.name===peakDay.name?C.amber:C.muted,fontWeight:d.name===peakDay.name?700:400}}>{d.name}</div>)}
+            </div>
+            <div style={{color:C.muted,fontSize:11,lineHeight:1.6,borderTop:`1px solid ${C.border}`,paddingTop:10}}>
+              <span style={{color:C.teal,fontWeight:700}}>{peakDay.name}</span> is your busiest day · <span style={{color:C.sub,fontWeight:700}}>{quietDay.name}</span> is typically quietest.
+              {wkdDiff!==null&&Math.abs(wkdDiff)>=10&&<span> Weekdays average <span style={{color:C.sub,fontWeight:700}}>{Math.abs(wkdDiff)}% {wkdDiff<0?"fewer":"more"}</span> events per day than weekends.</span>}
+            </div>
           </div>
           <div style={cardStyle}>
             {secLabel("Clustering")}
-            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8}}>
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:8,marginBottom:12}}>
               {[{label:"Isolated",value:isolated,sub:"single events",color:C.green},{label:"Clusters",value:clustered.length,sub:`≥2 within ${CLUSTER_GAP}min`,color:C.amber},{label:"Large (5+)",value:bigClusters.length,sub:"in one burst",color:C.red}].map(({label,value,sub,color})=>(
                 <div key={label} style={{background:"#0a0f1a",border:`1px solid ${C.border}`,borderRadius:10,padding:"10px"}}>
                   <div style={{color:C.muted,fontSize:9,fontWeight:700,textTransform:"uppercase",marginBottom:2}}>{label}</div>
@@ -669,44 +682,214 @@ function TrendsTab({events,food}){
                 </div>
               ))}
             </div>
+            <div style={{color:C.muted,fontSize:11,lineHeight:1.6,borderTop:`1px solid ${C.border}`,paddingTop:10}}>
+              {clustered.length===0
+                ? "No clusters detected — all events in this period appear to be isolated."
+                : `${eventsInClusters} of ${evts.length} events (${evts.length?Math.round(eventsInClusters/evts.length*100):0}%) occurred in groups of 2 or more within ${CLUSTER_GAP} minutes of each other.${bigClusters.length>0?` ${bigClusters.length} burst${bigClusters.length!==1?"s":""} of 5+ events detected.`:""}`
+              }
+            </div>
           </div>
         </div>
       )}
-      {section==="weekly"&&(
-        <div style={cardStyle}>
-          {secLabel("8-Week Trend")}
-          <SvgTrendLine values={weekTrend} color={C.green} height={desk?120:60}/>
-          <div style={{display:"flex",justifyContent:"space-between",marginTop:4}}>
-            <span style={{color:C.muted,fontSize:cf.axisLabel}}>8 wks ago</span>
-            <span style={{color:C.green,fontSize:cf.axisLabel,fontWeight:700}}>This week</span>
+
+      {/* ── Weekly ── */}
+      {section==="weekly"&&(()=>{
+        const totalEvents=weekTrend.reduce((s,v)=>s+v,0);
+        const avgPerWeek=(totalEvents/8).toFixed(1);
+        const thisWeek=weekTrend[7];
+        const prevWeek=weekTrend[6];
+        const weekDiff=thisWeek-prevWeek;
+        const peakWeekVal=Math.max(...weekTrend);
+        const peakWeekIdx=weekTrend.lastIndexOf(peakWeekVal);
+        const weeksAgoLabel=7-peakWeekIdx===0?"this week":7-peakWeekIdx===1?"last week":`${7-peakWeekIdx} weeks ago`;
+        return(
+          <div>
+            {/* Summary stats */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:14}}>
+              {[
+                {label:"This week",val:thisWeek,color:C.green,sub:"events so far"},
+                {label:"8-wk avg",val:avgPerWeek,color:C.teal,sub:"events per week"},
+                {label:"vs last week",val:weekDiff===0?"=":`${weekDiff>0?"+":""}${weekDiff}`,color:weekDiff<0?C.green:weekDiff>0?C.red:C.muted,sub:weekDiff===0?"no change":weekDiff<0?"fewer events":"more events"},
+              ].map(({label,val,color,sub})=>(
+                <div key={label} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
+                  <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>{label}</div>
+                  <div style={{color,fontSize:desk?28:22,fontWeight:800,lineHeight:1}}>{val}</div>
+                  <div style={{color:C.muted,fontSize:10,marginTop:3}}>{sub}</div>
+                </div>
+              ))}
+            </div>
+            <div style={cardStyle}>
+              {secLabel("8-Week Trend")}
+              <div style={{color:C.muted,fontSize:11,marginBottom:12,lineHeight:1.6}}>
+                Each bar is one 7-day week. The rightmost bar is the current week (partial). Bars are rate-normalised so a partial current week isn't unfairly low.
+              </div>
+              <SvgTrendLine values={weekTrend} color={C.green} height={desk?120:60}/>
+              <div style={{display:"flex",justifyContent:"space-between",marginTop:6}}>
+                <span style={{color:C.muted,fontSize:cf.axisLabel}}>8 wks ago</span>
+                <span style={{color:C.green,fontSize:cf.axisLabel,fontWeight:700}}>This week</span>
+              </div>
+              <div style={{color:C.muted,fontSize:11,lineHeight:1.6,borderTop:`1px solid ${C.border}`,paddingTop:10,marginTop:10}}>
+                Peak week was <span style={{color:C.amber,fontWeight:700}}>{peakWeekVal} events</span> ({weeksAgoLabel}).
+                {" "}8-week average: <span style={{color:C.teal,fontWeight:700}}>{avgPerWeek} events/week</span>.
+                {weekDiff!==0&&<span> This week is {Math.abs(weekDiff)} event{Math.abs(weekDiff)!==1?"s":""} <span style={{color:weekDiff<0?C.green:C.red,fontWeight:700}}>{weekDiff<0?"below":"above"}</span> last week.</span>}
+              </div>
+            </div>
+            {/* Week breakdown table */}
+            <div style={cardStyle}>
+              {secLabel("Week by Week")}
+              <div style={{color:C.muted,fontSize:11,marginBottom:10}}>Most recent 8 weeks, newest first.</div>
+              {[...weekTrend].reverse().map((cnt,i)=>{
+                const wAgo=i;
+                const label=wAgo===0?"This week":wAgo===1?"Last week":`${wAgo} weeks ago`;
+                const pct=peakWeekVal>0?Math.round((cnt/peakWeekVal)*100):0;
+                return(
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
+                    <div style={{minWidth:90,fontSize:12,color:wAgo===0?C.green:C.muted,fontWeight:wAgo===0?700:400}}>{label}</div>
+                    <div style={{flex:1,height:6,background:"#1e293b",borderRadius:3,overflow:"hidden"}}>
+                      <div style={{height:"100%",width:`${pct}%`,background:wAgo===0?C.green:C.teal,borderRadius:3,transition:"width .3s"}}/>
+                    </div>
+                    <div style={{minWidth:28,textAlign:"right",fontSize:13,fontWeight:700,color:wAgo===0?C.green:C.sub}}>{cnt}</div>
+                  </div>
+                );
+              })}
+            </div>
           </div>
-        </div>
-      )}
-      {section==="monthly"&&(
-        <div style={cardStyle}>
-          {secLabel("8-Month Trend")}
-          <SvgTrendLine values={monthTrend.map(m=>m.cnt)} color={C.green} height={desk?120:60}/>
-          <div style={{display:"flex",marginTop:4}}>
-            {monthTrend.map((m,i)=><span key={i} style={{flex:1,textAlign:"center",fontSize:cf.axisLabel,color:i===7?C.green:C.muted,fontWeight:i===7?700:400}}>{m.label}</span>)}
+        );
+      })()}
+
+      {/* ── Monthly ── */}
+      {section==="monthly"&&(()=>{
+        const totalMonthly=monthTrend.reduce((s,m)=>s+m.cnt,0);
+        const avgPerMonth=(totalMonthly/8).toFixed(1);
+        const thisMonth=monthTrend[7];
+        const prevMonth=monthTrend[6];
+        const monthDiff=thisMonth.cnt-prevMonth.cnt;
+        const peakMonth=monthTrend.reduce((a,b)=>b.cnt>a.cnt?b:a,monthTrend[0]);
+        const quietMonth=monthTrend.reduce((a,b)=>b.cnt<a.cnt?b:a,monthTrend[0]);
+        return(
+          <div>
+            {/* Summary stats */}
+            <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:10,marginBottom:14}}>
+              {[
+                {label:thisMonth.label,val:thisMonth.cnt,color:C.green,sub:"events this month"},
+                {label:"8-mo avg",val:avgPerMonth,color:C.teal,sub:"events per month"},
+                {label:"vs last month",val:monthDiff===0?"=":`${monthDiff>0?"+":""}${monthDiff}`,color:monthDiff<0?C.green:monthDiff>0?C.red:C.muted,sub:monthDiff===0?"no change":monthDiff<0?"fewer events":"more events"},
+              ].map(({label,val,color,sub})=>(
+                <div key={label} style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
+                  <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>{label}</div>
+                  <div style={{color,fontSize:desk?28:22,fontWeight:800,lineHeight:1}}>{val}</div>
+                  <div style={{color:C.muted,fontSize:10,marginTop:3}}>{sub}</div>
+                </div>
+              ))}
+            </div>
+            <div style={cardStyle}>
+              {secLabel("8-Month Trend")}
+              <div style={{color:C.muted,fontSize:11,marginBottom:12,lineHeight:1.6}}>
+                Each point is one calendar month. The rightmost point is the current month (partial). Useful for spotting seasonal patterns or gradual changes over time.
+              </div>
+              <SvgTrendLine values={monthTrend.map(m=>m.cnt)} color={C.green} height={desk?120:60}/>
+              <div style={{display:"flex",marginTop:6}}>
+                {monthTrend.map((m,i)=><span key={i} style={{flex:1,textAlign:"center",fontSize:cf.axisLabel,color:i===7?C.green:C.muted,fontWeight:i===7?700:400}}>{m.label}</span>)}
+              </div>
+              <div style={{color:C.muted,fontSize:11,lineHeight:1.6,borderTop:`1px solid ${C.border}`,paddingTop:10,marginTop:10}}>
+                Highest month: <span style={{color:C.amber,fontWeight:700}}>{peakMonth.label} ({peakMonth.cnt} events)</span>.
+                {" "}Lowest: <span style={{color:C.green,fontWeight:700}}>{quietMonth.label} ({quietMonth.cnt} events)</span>.
+                {" "}8-month average: <span style={{color:C.teal,fontWeight:700}}>{avgPerMonth}/month</span>.
+              </div>
+            </div>
+            {/* Month breakdown table */}
+            <div style={cardStyle}>
+              {secLabel("Month by Month")}
+              <div style={{color:C.muted,fontSize:11,marginBottom:10}}>Most recent 8 months, newest first.</div>
+              {[...monthTrend].reverse().map((m,i)=>{
+                const pct=peakMonth.cnt>0?Math.round((m.cnt/peakMonth.cnt)*100):0;
+                const isCurrent=i===0;
+                return(
+                  <div key={i} style={{display:"flex",alignItems:"center",gap:10,padding:"7px 0",borderBottom:`1px solid ${C.border}`}}>
+                    <div style={{minWidth:52,fontSize:12,color:isCurrent?C.green:C.muted,fontWeight:isCurrent?700:400}}>{m.label}{isCurrent?" *":""}</div>
+                    <div style={{flex:1,height:6,background:"#1e293b",borderRadius:3,overflow:"hidden"}}>
+                      <div style={{height:"100%",width:`${pct}%`,background:isCurrent?C.green:C.teal,borderRadius:3}}/>
+                    </div>
+                    <div style={{minWidth:28,textAlign:"right",fontSize:13,fontWeight:700,color:isCurrent?C.green:C.sub}}>{m.cnt}</div>
+                  </div>
+                );
+              })}
+              <div style={{color:"#374151",fontSize:10,marginTop:8}}>* current month (partial)</div>
+            </div>
           </div>
-        </div>
-      )}
+        );
+      })()}
+
+      {/* ── Food Correlations ── */}
       {section==="food"&&(()=>{
         const correlations=evts.map(ev=>({event:ev,priorFood:loggedBefore(food,ev.timestamp,4)})).filter(c=>c.priorFood.length>0);
         const foodFreq={};
         correlations.forEach(({priorFood})=>{priorFood.forEach(f=>{foodFreq[f.name]=(foodFreq[f.name]||0)+1;});});
         const topFoods=Object.entries(foodFreq).sort((a,b)=>b[1]-a[1]).slice(0,10);
+        const coveredEvents=correlations.length;
+        const maxFreq=topFoods.length?topFoods[0][1]:1;
         return(
-          <div style={cardStyle}>
-            {secLabel("Foods in 4h Before Event")}
-            {topFoods.length===0?<p style={{color:C.muted,fontSize:13,textAlign:"center",padding:"16px 0"}}>No food data correlates with events in this window</p>:(
-              topFoods.map(([name,count])=>(
-                <div key={name} style={{display:"flex",justifyContent:"space-between",alignItems:"center",padding:"8px 0",borderBottom:`1px solid ${C.border}`}}>
-                  <span style={{color:C.teal,fontSize:13}}>{name}</span>
-                  <span style={{color:C.muted,fontSize:12}}>{count} events preceded</span>
+          <div>
+            {/* Explainer */}
+            <div style={{background:"#0a1628",border:"1px solid #1e3a5f",borderRadius:12,padding:14,marginBottom:14}}>
+              <div style={{color:"#93c5fd",fontSize:12,fontWeight:700,marginBottom:4}}>ℹ️ How this works</div>
+              <div style={{color:C.muted,fontSize:12,lineHeight:1.7}}>
+                Any food logged within <span style={{color:C.text,fontWeight:600}}>4 hours before</span> a seizure event is counted as a potential correlate. A high count doesn't confirm causation — it just shows which foods frequently appear in that window.
+                {food.length===0&&<span style={{display:"block",marginTop:6,color:C.amber}}> Start logging meals to see correlations.</span>}
+              </div>
+            </div>
+            {/* Stats strip */}
+            {coveredEvents>0&&(
+              <div style={{display:"grid",gridTemplateColumns:"1fr 1fr",gap:10,marginBottom:14}}>
+                <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
+                  <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Events with food data</div>
+                  <div style={{color:C.teal,fontSize:desk?28:22,fontWeight:800,lineHeight:1}}>{coveredEvents}</div>
+                  <div style={{color:C.muted,fontSize:10,marginTop:3}}>of {evts.length} total ({evts.length?Math.round(coveredEvents/evts.length*100):0}%)</div>
                 </div>
-              ))
+                <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:"12px 14px",textAlign:"center"}}>
+                  <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.06em",marginBottom:4}}>Unique foods seen</div>
+                  <div style={{color:C.amber,fontSize:desk?28:22,fontWeight:800,lineHeight:1}}>{Object.keys(foodFreq).length}</div>
+                  <div style={{color:C.muted,fontSize:10,marginTop:3}}>in the 4h window</div>
+                </div>
+              </div>
             )}
+            <div style={cardStyle}>
+              {secLabel("Most Frequent Before Events")}
+              {topFoods.length===0?(
+                <p style={{color:C.muted,fontSize:13,textAlign:"center",padding:"16px 0"}}>
+                  {food.length===0?"No meals logged yet — add meals to track correlations.":"No food logged within 4h of any events in this period."}
+                </p>
+              ):(
+                <div>
+                  <div style={{color:C.muted,fontSize:11,marginBottom:12,lineHeight:1.6}}>
+                    Showing top {topFoods.length} food{topFoods.length!==1?"s":""} most frequently logged in the 4 hours before a seizure. Bar width shows relative frequency.
+                  </div>
+                  {topFoods.map(([name,count],i)=>{
+                    const pct=Math.round((count/maxFreq)*100);
+                    const pctOfEvents=evts.length?Math.round((count/evts.length)*100):0;
+                    return(
+                      <div key={name} style={{marginBottom:12}}>
+                        <div style={{display:"flex",justifyContent:"space-between",alignItems:"baseline",marginBottom:4}}>
+                          <span style={{color:C.teal,fontSize:13,fontWeight:600}}>{name}</span>
+                          <div style={{display:"flex",gap:12,alignItems:"baseline"}}>
+                            <span style={{color:C.muted,fontSize:11}}>{pctOfEvents}% of events</span>
+                            <span style={{color:C.sub,fontSize:13,fontWeight:700}}>{count}×</span>
+                          </div>
+                        </div>
+                        <div style={{height:6,background:"#1e293b",borderRadius:3,overflow:"hidden"}}>
+                          <div style={{height:"100%",width:`${pct}%`,background:i===0?"#f59e0b":C.teal,borderRadius:3,transition:"width .3s"}}/>
+                        </div>
+                      </div>
+                    );
+                  })}
+                  {topFoods.length>0&&(
+                    <div style={{color:"#374151",fontSize:11,marginTop:10,lineHeight:1.6,borderTop:`1px solid ${C.border}`,paddingTop:10}}>
+                      Share this list with your neurologist — they may recognise dietary triggers relevant to FND or related conditions.
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
           </div>
         );
       })()}
