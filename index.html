@@ -217,9 +217,23 @@
 </head>
 <body>
 <div id="root">
-  <div class="loader"><div class="spinner"></div><span>Starting up…</span></div>
+  <div class="loader" id="initial-loader">
+    <div class="spinner"></div>
+    <span id="loader-msg">Starting up…</span>
+    <button id="reload-btn" onclick="window.location.reload()" style="display:none;margin-top:16px;padding:10px 20px;border-radius:10px;border:1px solid #1e2d45;background:#161f35;color:#e2e8f0;font-family:inherit;font-size:14px;cursor:pointer;">Tap to reload</button>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
+<script>
+  setTimeout(function() {
+    var loader = document.getElementById('initial-loader');
+    if (!loader) return;
+    var msg = document.getElementById('loader-msg');
+    var btn = document.getElementById('reload-btn');
+    if (msg) msg.textContent = 'Taking longer than expected…';
+    if (btn) btn.style.display = 'block';
+  }, 12000);
+</script>
 
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
@@ -1323,8 +1337,27 @@ function Root() {
   const [fileId, setFileId]     = useState(localStorage.getItem('fnd_file_id') || null);
   const [driveData, setDriveData]       = useState(null);
   const [driveInstance, setDriveInstance] = useState(null);
-  const [status, setStatus]     = useState('idle'); // idle|loading|file-pick|ready|error
+  const [status, setStatus]     = useState('idle');
   const [errorMsg, setErrorMsg] = useState('');
+  const [gsiReady, setGsiReady] = useState(!!window.google?.accounts?.oauth2);
+
+  // Poll until the Google Identity Services script has loaded
+  useEffect(() => {
+    if (gsiReady) return;
+    let attempts = 0;
+    const t = setInterval(() => {
+      attempts++;
+      if (window.google?.accounts?.oauth2) {
+        setGsiReady(true);
+        clearInterval(t);
+      } else if (attempts > 30) {
+        clearInterval(t);
+        setErrorMsg('Could not load Google sign-in. Check your internet connection and reload the app.');
+        setStatus('error');
+      }
+    }, 500);
+    return () => clearInterval(t);
+  }, [gsiReady]);
 
   async function handleToken(accessToken) {
     setToken(accessToken);
@@ -1389,21 +1422,22 @@ function Root() {
     }
   }
 
-  if (!clientId) return <ClientIdSetup onSave={setClientId}/>;
-  if (!token)   return <AuthScreen clientId={clientId} onToken={handleToken}/>;
-  if (status==='loading') return <div className="loader"><div className="spinner"/><span>Loading Drive data…</span></div>;
   if (status==='error')   return (
     <div className="splash">
       <div style={{fontSize:40,marginBottom:12}}>⚠️</div>
       <h2 style={{marginBottom:8}}>Something went wrong</h2>
       <p style={{color:'var(--muted)',fontSize:14,marginBottom:20,maxWidth:280,lineHeight:1.6}}>{errorMsg}</p>
-      <button className="btn btn-secondary" onClick={()=>{setToken(null);setStatus('idle');}}>← Try again</button>
+      <button className="btn btn-secondary" onClick={()=>{setToken(null);setStatus('idle');setGsiReady(!!window.google?.accounts?.oauth2);}}>← Try again</button>
     </div>
   );
+  if (!clientId) return <ClientIdSetup onSave={setClientId}/>;
+  if (!gsiReady) return <div className="loader"><div className="spinner"/><span>Loading Google sign-in…</span></div>;
+  if (!token)   return <AuthScreen clientId={clientId} onToken={handleToken}/>;
+  if (status==='loading') return <div className="loader"><div className="spinner"/><span>Loading Drive data…</span></div>;
   if (status==='file-pick') return <DriveFilePicker drive={driveInstance} onFile={handleFilePick}/>;
   if (status==='ready') return <MainApp token={token} userInfo={userInfo} fileId={fileId} initialData={driveData} driveInstance={driveInstance}/>;
 
-  return <div className="loader"><div className="spinner"/></div>;
+  return <div className="loader"><div className="spinner"/><span>Starting up…</span></div>;
 }
 
 /* ── Mount ── */
