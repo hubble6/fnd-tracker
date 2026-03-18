@@ -1,0 +1,1423 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover"/>
+  <meta name="theme-color" content="#0a0f1e"/>
+  <meta name="description" content="FND Tracker — daily symptom check-in for Functional Neurological Disorder"/>
+  <meta name="apple-mobile-web-app-capable" content="yes"/>
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent"/>
+  <meta name="apple-mobile-web-app-title" content="FND Tracker"/>
+  <link rel="apple-touch-icon" href="icons/icon-192.png"/>
+  <link rel="manifest" href="manifest.json"/>
+  <title>FND Tracker</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link href="https://fonts.googleapis.com/css2?family=DM+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;1,400&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet"/>
+
+  <!-- Google Identity + Drive APIs -->
+  <script src="https://accounts.google.com/gsi/client" async defer></script>
+
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0a0f1e;
+      --surface:   #0f1628;
+      --card:      #161f35;
+      --card2:     #1c2840;
+      --border:    #1e2d45;
+      --text:      #e2e8f0;
+      --muted:     #5a7194;
+      --accent:    #38bdf8;
+      --accent-dk: #0ea5e9;
+      --violet:    #818cf8;
+      --green:     #34d399;
+      --green-dk:  #059669;
+      --amber:     #fbbf24;
+      --red:       #f87171;
+      --radius:    16px;
+      --font:      'DM Sans', sans-serif;
+      --mono:      'DM Mono', monospace;
+      --safe-top:  env(safe-area-inset-top, 0px);
+      --safe-bot:  env(safe-area-inset-bottom, 0px);
+    }
+
+    html, body { height: 100%; background: var(--bg); color: var(--text); font-family: var(--font); font-size: 16px; line-height: 1.5; -webkit-font-smoothing: antialiased; overflow: hidden; }
+    #root { height: 100%; display: flex; flex-direction: column; }
+    .scroll-area { flex: 1; overflow-y: auto; overflow-x: hidden; -webkit-overflow-scrolling: touch; padding-bottom: calc(76px + var(--safe-bot)); }
+    ::-webkit-scrollbar { width: 0; } * { scrollbar-width: none; }
+
+    /* ── Typography ── */
+    h1 { font-size: 1.75rem; font-weight: 700; letter-spacing: -0.03em; }
+    h2 { font-size: 1.2rem; font-weight: 600; letter-spacing: -0.02em; }
+    h3 { font-size: 1rem; font-weight: 600; }
+
+    /* ── Layout ── */
+    .page { padding: 18px 16px 0; max-width: 500px; margin: 0 auto; }
+
+    /* ── Cards ── */
+    .card { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; margin-bottom: 12px; }
+    .card-inner { background: var(--card2); border: 1px solid var(--border); border-radius: 12px; padding: 12px; margin-bottom: 8px; }
+
+    /* ── Buttons ── */
+    .btn { display: inline-flex; align-items: center; justify-content: center; gap: 8px; padding: 14px 20px; border-radius: 12px; border: none; font-family: var(--font); font-size: 15px; font-weight: 600; cursor: pointer; transition: opacity .15s, transform .1s; -webkit-tap-highlight-color: transparent; min-height: 52px; }
+    .btn:active { transform: scale(0.97); opacity: .82; }
+    .btn-primary  { background: var(--accent); color: #060d1e; }
+    .btn-secondary{ background: var(--card); color: var(--text); border: 1px solid var(--border); }
+    .btn-ghost    { background: transparent; color: var(--muted); }
+    .btn-green    { background: #063b28; color: var(--green); border: 1px solid #065f46; }
+    .btn-red      { background: #3b0a0a; color: var(--red); border: 1px solid #7f1d1d; }
+    .btn-full     { width: 100%; }
+    .btn-sm       { padding: 8px 14px; font-size: 13px; min-height: 36px; border-radius: 8px; }
+
+    /* ── Bottom Nav ── */
+    .bottom-nav { position: fixed; bottom: 0; left: 0; right: 0; background: var(--surface); border-top: 1px solid var(--border); display: flex; padding-bottom: var(--safe-bot); z-index: 100; }
+    .nav-item { flex: 1; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 9px 4px; gap: 3px; cursor: pointer; color: var(--muted); font-size: 10px; font-weight: 600; letter-spacing: .02em; text-transform: uppercase; transition: color .15s; -webkit-tap-highlight-color: transparent; border: none; background: none; font-family: var(--font); }
+    .nav-item.active { color: var(--accent); }
+    .nav-item svg { width: 21px; height: 21px; }
+    .nav-badge { position: relative; }
+    .nav-badge::after { content: ''; position: absolute; top: -2px; right: -4px; width: 7px; height: 7px; border-radius: 50%; background: var(--red); border: 1.5px solid var(--surface); }
+
+    /* ── Top bar ── */
+    .topbar { display: flex; align-items: center; justify-content: space-between; padding: calc(var(--safe-top) + 13px) 16px 10px; background: var(--bg); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 50; }
+    .topbar-logo { font-size: 16px; font-weight: 700; letter-spacing: -0.02em; display: flex; align-items: center; gap: 8px; }
+    .logo-bolt { width: 28px; height: 28px; background: linear-gradient(135deg, var(--accent), var(--violet)); border-radius: 8px; display: flex; align-items: center; justify-content: center; font-size: 15px; flex-shrink: 0; }
+
+    /* ── Sync status pill ── */
+    .sync-pill { display: flex; align-items: center; gap: 5px; padding: 4px 10px; border-radius: 20px; background: var(--card); border: 1px solid var(--border); font-size: 11px; font-weight: 600; color: var(--muted); cursor: pointer; -webkit-tap-highlight-color: transparent; }
+    .sync-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+    .sync-dot.stale  { background: var(--amber); animation: blink 1.5s infinite; }
+    .sync-dot.saving { background: var(--accent); animation: blink .5s infinite; }
+    .sync-dot.offline{ background: var(--muted); }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:.25} }
+
+    /* ── Section label ── */
+    .section-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .08em; color: var(--muted); margin-bottom: 10px; }
+
+    /* ── Step wizard ── */
+    .step-track { display: flex; gap: 5px; margin-bottom: 22px; }
+    .step-pip { flex: 1; height: 3px; border-radius: 2px; background: var(--border); transition: background .3s; }
+    .step-pip.active { background: var(--accent); }
+    .step-pip.done   { background: var(--green); }
+
+    /* ── Flare banner ── */
+    .flare-banner { background: linear-gradient(120deg, #2a0808 0%, #450a0a 100%); border: 1px solid #7f1d1d; border-radius: 14px; padding: 14px 16px; display: flex; align-items: center; gap: 12px; cursor: pointer; margin-bottom: 18px; -webkit-tap-highlight-color: transparent; transition: opacity .15s; }
+    .flare-banner:active { opacity: .8; }
+
+    /* ── Mood grid ── */
+    .mood-grid { display: grid; grid-template-columns: repeat(5, 1fr); gap: 8px; margin: 14px 0; }
+    .mood-btn { aspect-ratio: 1; border-radius: 12px; border: 2px solid var(--border); background: var(--card); display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 3px; cursor: pointer; transition: border-color .15s, background .15s, transform .1s; -webkit-tap-highlight-color: transparent; }
+    .mood-btn:active { transform: scale(.91); }
+    .mood-btn.sel { border-color: var(--accent); background: rgba(56,189,248,.1); }
+    .mood-emoji { font-size: 22px; }
+    .mood-label { font-size: 10px; color: var(--muted); font-weight: 600; }
+
+    /* ── Symptom list ── */
+    .sym-row { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 8px 0; border-bottom: 1px solid var(--border); }
+    .sym-row:last-child { border-bottom: none; }
+    .sym-name { font-size: 13px; font-weight: 500; flex: 1; }
+    .sev-group { display: flex; gap: 4px; }
+    .sev-btn { width: 34px; height: 34px; border-radius: 8px; border: 1.5px solid var(--border); background: var(--card2); color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer; transition: all .12s; -webkit-tap-highlight-color: transparent; }
+    .sev-btn:active { transform: scale(.87); }
+    .sev-btn.s1.on { background: #042512; border-color: var(--green);  color: var(--green); }
+    .sev-btn.s2.on { background: #1c1206; border-color: var(--amber);  color: var(--amber); }
+    .sev-btn.s3.on { background: #2a0505; border-color: var(--red);    color: var(--red); }
+
+    /* ── Sleep ── */
+    .sleep-display { font-size: 3rem; font-weight: 700; font-family: var(--mono); color: var(--accent); text-align: center; letter-spacing: -.02em; }
+    .sleep-stepper { display: flex; gap: 12px; margin: 10px 0 18px; }
+    .sleep-btn { flex: 1; height: 52px; border-radius: 12px; border: 1.5px solid var(--border); background: var(--card2); color: var(--text); font-size: 26px; cursor: pointer; -webkit-tap-highlight-color: transparent; transition: background .1s; }
+    .sleep-btn:active { background: var(--border); }
+    .quality-row { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+    .quality-btn { padding: 10px 4px; border-radius: 10px; border: 1.5px solid var(--border); background: var(--card2); color: var(--muted); font-size: 12px; font-weight: 700; cursor: pointer; text-align: center; transition: all .12s; -webkit-tap-highlight-color: transparent; }
+    .quality-btn.sel { border-color: var(--violet); background: rgba(129,140,248,.12); color: var(--violet); }
+
+    /* ── Emotion chips ── */
+    .chip-wrap { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+    .chip { padding: 7px 14px; border-radius: 20px; border: 1.5px solid var(--border); background: var(--card2); color: var(--muted); font-size: 13px; font-weight: 500; cursor: pointer; transition: all .12s; -webkit-tap-highlight-color: transparent; }
+    .chip:active { transform: scale(.95); }
+    .chip.sel { border-color: var(--violet); background: rgba(129,140,248,.12); color: var(--violet); }
+
+    /* ── Notes ── */
+    textarea { width: 100%; background: var(--card2); border: 1.5px solid var(--border); border-radius: 12px; padding: 12px 14px; color: var(--text); font-family: var(--font); font-size: 14px; resize: none; outline: none; transition: border-color .2s; min-height: 82px; }
+    textarea:focus { border-color: var(--accent); }
+    textarea::placeholder { color: var(--muted); }
+
+    /* ── History ── */
+    .day-group { border-left: 2.5px solid var(--border); padding-left: 14px; margin-bottom: 22px; }
+    .day-group.flare { border-left-color: var(--red); }
+    .day-group.good  { border-left-color: var(--green); }
+    .day-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: .07em; color: var(--muted); margin-bottom: 8px; }
+    .entry-card { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 12px 14px; margin-bottom: 8px; }
+    .entry-top { display: flex; align-items: center; gap: 10px; }
+    .entry-emoji { font-size: 22px; flex-shrink: 0; }
+    .entry-info { flex: 1; }
+    .entry-time { font-size: 11px; color: var(--muted); font-family: var(--mono); }
+    .entry-who  { font-size: 11px; color: var(--accent); font-weight: 600; }
+    .pill-row { display: flex; flex-wrap: wrap; gap: 4px; margin-top: 7px; }
+    .pill { padding: 2px 8px; border-radius: 6px; font-size: 11px; font-weight: 600; }
+    .pill.blue   { background: rgba(56,189,248,.1);  color: var(--accent); border: 1px solid rgba(56,189,248,.2); }
+    .pill.green  { background: rgba(52,211,153,.1);  color: var(--green);  border: 1px solid rgba(52,211,153,.2); }
+    .pill.amber  { background: rgba(251,191,36,.1);  color: var(--amber);  border: 1px solid rgba(251,191,36,.2); }
+    .pill.red    { background: rgba(248,113,113,.1); color: var(--red);    border: 1px solid rgba(248,113,113,.2); }
+    .pill.violet { background: rgba(129,140,248,.1); color: var(--violet); border: 1px solid rgba(129,140,248,.2); }
+
+    /* ── Stats ── */
+    .stat-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 14px; }
+    .stat-box { background: var(--card); border: 1px solid var(--border); border-radius: 12px; padding: 14px; text-align: center; }
+    .stat-num { font-size: 1.8rem; font-weight: 700; font-family: var(--mono); }
+    .stat-lbl { font-size: 11px; color: var(--muted); margin-top: 2px; }
+
+    /* ── Auth / Onboarding ── */
+    .splash { min-height: 100vh; display: flex; flex-direction: column; align-items: center; justify-content: center; padding: 32px 24px; text-align: center; }
+    .splash-logo { width: 80px; height: 80px; background: linear-gradient(135deg, var(--accent), var(--violet)); border-radius: 22px; display: flex; align-items: center; justify-content: center; font-size: 40px; margin: 0 auto 20px; box-shadow: 0 0 40px rgba(56,189,248,.2); }
+    .google-btn { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 14px 24px; border-radius: 12px; border: 1.5px solid var(--border); background: var(--card); color: var(--text); font-family: var(--font); font-size: 15px; font-weight: 600; cursor: pointer; transition: all .15s; min-height: 52px; min-width: 260px; -webkit-tap-highlight-color: transparent; }
+    .google-btn:active { transform: scale(.97); }
+    .google-icon { width: 20px; height: 20px; flex-shrink: 0; }
+
+    /* ── Drive setup ── */
+    .setup-step { display: flex; gap: 12px; padding: 12px 0; border-bottom: 1px solid var(--border); }
+    .setup-step:last-child { border-bottom: none; }
+    .step-num { width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: #060d1e; font-size: 12px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 1px; }
+    .step-num.done { background: var(--green); }
+
+    /* ── Modal ── */
+    .modal-backdrop { position: fixed; inset: 0; background: rgba(0,0,0,.65); z-index: 200; display: flex; align-items: flex-end; padding: 16px; }
+    .modal { background: var(--card); border: 1px solid var(--border); border-radius: 20px; padding: 22px; width: 100%; max-width: 480px; margin: 0 auto; max-height: 80vh; overflow-y: auto; }
+    .modal-title { font-size: 17px; font-weight: 700; margin-bottom: 4px; }
+    .modal-sub { font-size: 13px; color: var(--muted); margin-bottom: 18px; }
+
+    /* ── Toast ── */
+    .toast { position: fixed; bottom: calc(76px + var(--safe-bot) + 10px); left: 50%; transform: translateX(-50%) translateY(16px); background: var(--card2); border: 1px solid var(--border); border-radius: 10px; padding: 10px 18px; font-size: 13px; font-weight: 600; white-space: nowrap; z-index: 300; pointer-events: none; opacity: 0; transition: opacity .2s, transform .2s; }
+    .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
+
+    /* ── Loading ── */
+    .loader { display: flex; flex-direction: column; align-items: center; justify-content: center; height: 100%; gap: 14px; color: var(--muted); font-size: 14px; }
+    .spinner { width: 30px; height: 30px; border: 2.5px solid var(--border); border-top-color: var(--accent); border-radius: 50%; animation: spin .7s linear infinite; }
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    /* ── Info box ── */
+    .info-box { background: rgba(56,189,248,.05); border: 1px solid rgba(56,189,248,.15); border-radius: 12px; padding: 12px 14px; font-size: 13px; color: var(--muted); line-height: 1.6; margin-bottom: 14px; }
+    .info-box strong { color: var(--text); }
+    .info-box a { color: var(--accent); text-decoration: none; }
+
+    /* ── Animations ── */
+    .fade-in { animation: fadeIn .22s ease-out; }
+    @keyframes fadeIn { from { opacity:0; transform:translateY(6px); } to { opacity:1; transform:none; } }
+
+    /* ── Print styles (doctor report) ── */
+    @media print {
+      body { background: white; color: black; }
+      .bottom-nav, .topbar, .btn, .modal-backdrop { display: none !important; }
+      .scroll-area { overflow: visible; padding: 0; }
+      .print-report { display: block !important; }
+    }
+    .print-report { display: none; }
+  </style>
+</head>
+<body>
+<div id="root">
+  <div class="loader"><div class="spinner"></div><span>Starting up…</span></div>
+</div>
+<div class="toast" id="toast"></div>
+
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback, createContext, useContext } = React;
+
+/* ═══════════════════════════════════════════════════════════
+   CONFIGURATION
+   Replace CLIENT_ID with your own Google Cloud OAuth client ID.
+   See SETUP.md for instructions.
+   ═══════════════════════════════════════════════════════════ */
+const CLIENT_ID = localStorage.getItem('fnd_google_client_id') || '';
+const DRIVE_FILE_NAME = 'fnd-tracker-data.json';
+const SCOPES = 'https://www.googleapis.com/auth/drive.file openid email profile';
+
+/* ═══════════════════════════════════════════════════════════
+   CONSTANTS
+   ═══════════════════════════════════════════════════════════ */
+const SYMPTOMS = [
+  "Seizures / Episodes","Tremors","Brain Fog","Fatigue",
+  "Headache / Migraine","Dizziness","Tingling / Numbness",
+  "Vision Changes","Speech Difficulties","Weakness",
+  "Pain","Nausea","Anxiety / Mood"
+];
+const EMOTIONS = [
+  "Grateful","Hopeful","Calm","Tired","Frustrated","Anxious",
+  "Sad","Overwhelmed","Proud","Loved","Isolated","Content"
+];
+const SLEEP_QUALITY = ["Poor","Fair","Good","Great"];
+const MOODS = [
+  { emoji:"😄", label:"Great", score:5 },
+  { emoji:"🙂", label:"Good",  score:4 },
+  { emoji:"😐", label:"Okay",  score:3 },
+  { emoji:"😞", label:"Low",   score:2 },
+  { emoji:"😣", label:"Awful", score:1 },
+];
+const FLARE_PRESET = {
+  mood:1, sleep:4, sleepQuality:"Poor",
+  symptoms: Object.fromEntries(SYMPTOMS.map(s=>[s,3])),
+  emotions: ["Overwhelmed","Frustrated","Tired"],
+  notes: "Flare day — auto-filled"
+};
+
+/* ═══════════════════════════════════════════════════════════
+   UTILITIES
+   ═══════════════════════════════════════════════════════════ */
+const uid = () => Date.now().toString(36) + Math.random().toString(36).slice(2,6);
+
+function toast(msg, color='var(--green)') {
+  const el = document.getElementById('toast');
+  el.textContent = msg;
+  el.style.color = color;
+  el.classList.add('show');
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.classList.remove('show'), 2400);
+}
+
+function fmt_date(iso) {
+  return new Date(iso).toLocaleDateString('en-CA',{weekday:'short',month:'short',day:'numeric'});
+}
+function fmt_time(iso) {
+  return new Date(iso).toLocaleTimeString('en-CA',{hour:'2-digit',minute:'2-digit',hour12:true});
+}
+function fmt_rel(iso) {
+  const d = Date.now() - new Date(iso).getTime();
+  if (d < 60000) return 'just now';
+  if (d < 3600000) return Math.floor(d/60000)+'m ago';
+  if (d < 86400000) return Math.floor(d/3600000)+'h ago';
+  return Math.floor(d/86400000)+'d ago';
+}
+
+function groupByDay(entries) {
+  const g = {};
+  entries.forEach(e => {
+    const k = new Date(e.timestamp).toDateString();
+    (g[k] = g[k] || []).push(e);
+  });
+  return Object.entries(g).sort((a,b) => new Date(b[0]) - new Date(a[0]));
+}
+
+const moodEmoji = score => MOODS.find(m=>m.score===score)?.emoji || '—';
+
+/* ═══════════════════════════════════════════════════════════
+   GOOGLE DRIVE API
+   ═══════════════════════════════════════════════════════════ */
+class DriveSync {
+  constructor(accessToken) {
+    this.token = accessToken;
+    this.fileId = null;
+  }
+
+  async req(url, opts={}) {
+    const r = await fetch(url, {
+      ...opts,
+      headers: { 'Authorization': `Bearer ${this.token}`, ...(opts.headers||{}) }
+    });
+    if (!r.ok) throw new Error(`Drive API ${r.status}: ${await r.text()}`);
+    return r;
+  }
+
+  // Find existing data file by name
+  async findFile() {
+    const r = await this.req(
+      `https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name,modifiedTime)&spaces=drive`
+    );
+    const data = await r.json();
+    return data.files?.[0] || null;
+  }
+
+  // Create empty data file
+  async createFile(data) {
+    const meta = { name: DRIVE_FILE_NAME, mimeType: 'application/json' };
+    const body = JSON.stringify(data);
+    const form = new FormData();
+    form.append('metadata', new Blob([JSON.stringify(meta)], { type: 'application/json' }));
+    form.append('file',     new Blob([body],                  { type: 'application/json' }));
+    const r = await this.req(
+      'https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id',
+      { method: 'POST', body: form }
+    );
+    const d = await r.json();
+    this.fileId = d.id;
+    return d.id;
+  }
+
+  // Download data file content
+  async readFile(fileId) {
+    const r = await this.req(
+      `https://www.googleapis.com/drive/v3/files/${fileId}?alt=media`
+    );
+    return r.json();
+  }
+
+  // Overwrite data file with new content
+  async writeFile(fileId, data) {
+    const body = JSON.stringify(data);
+    await this.req(
+      `https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media`,
+      { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body }
+    );
+  }
+
+  // Load or create file, return { fileId, data }
+  async init() {
+    let file = await this.findFile();
+    if (!file) {
+      const emptyData = { checkins: [], version: 1, createdAt: new Date().toISOString() };
+      const id = await this.createFile(emptyData);
+      return { fileId: id, data: emptyData, isNew: true };
+    }
+    const data = await this.readFile(file.id);
+    this.fileId = file.id;
+    return { fileId: file.id, data, isNew: false };
+  }
+
+  async save(fileId, data) {
+    await this.writeFile(fileId, data);
+  }
+
+  async refresh(fileId) {
+    return this.readFile(fileId);
+  }
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CONTEXT
+   ═══════════════════════════════════════════════════════════ */
+const AppCtx = createContext(null);
+
+/* ═══════════════════════════════════════════════════════════
+   SVG ICONS
+   ═══════════════════════════════════════════════════════════ */
+const Icons = {
+  Home:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><path d="M3 9.5L12 3l9 6.5V20a1 1 0 01-1 1H4a1 1 0 01-1-1V9.5z"/><path d="M9 21V12h6v9"/></svg>,
+  Plus:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"><path d="M12 5v14M5 12h14"/></svg>,
+  List:     () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M9 6h11M9 12h11M9 18h11M4 6h.01M4 12h.01M4 18h.01"/></svg>,
+  Chart:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M18 20V10M12 20V4M6 20v-6"/></svg>,
+  Settings: () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 00.33 1.82l.06.06a2 2 0 010 2.83 2 2 0 01-2.83 0l-.06-.06a1.65 1.65 0 00-1.82-.33 1.65 1.65 0 00-1 1.51V21a2 2 0 01-2 2 2 2 0 01-2-2v-.09A1.65 1.65 0 009 19.4a1.65 1.65 0 00-1.82.33l-.06.06a2 2 0 01-2.83-2.83l.06-.06A1.65 1.65 0 004.68 15a1.65 1.65 0 00-1.51-1H3a2 2 0 01-2-2 2 2 0 012-2h.09A1.65 1.65 0 004.6 9a1.65 1.65 0 00-.33-1.82l-.06-.06a2 2 0 012.83-2.83l.06.06A1.65 1.65 0 009 4.68a1.65 1.65 0 001-1.51V3a2 2 0 012-2 2 2 0 012 2v.09a1.65 1.65 0 001 1.51 1.65 1.65 0 001.82-.33l.06-.06a2 2 0 012.83 2.83l-.06.06A1.65 1.65 0 0019.4 9a1.65 1.65 0 001.51 1H21a2 2 0 012 2 2 2 0 01-2 2h-.09a1.65 1.65 0 00-1.51 1z"/></svg>,
+  Refresh:  () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M1 4v6h6"/><path d="M23 20v-6h-6"/><path d="M20.49 9A9 9 0 005.64 5.64L1 10M23 14l-4.64 4.36A9 9 0 013.51 15"/></svg>,
+  Drive:    () => <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round"><path d="M22.65 14.39L12 22.13 1.35 14.39a.84.84 0 01-.3-.94l1.22-3.78 2.44-7.51A.42.42 0 014.82 2a.43.43 0 01.58 0l.44.68 2.29 7.06h8.94l2.29-7.06.44-.68a.43.43 0 01.58 0 .42.42 0 01.11.16l2.44 7.51L23 13.45a.84.84 0 01-.35.94z"/></svg>,
+};
+
+/* ═══════════════════════════════════════════════════════════
+   CLIENT ID SETUP SCREEN
+   ═══════════════════════════════════════════════════════════ */
+function ClientIdSetup({ onSave }) {
+  const [id, setId] = useState('');
+  return (
+    <div className="splash fade-in" style={{paddingTop:'env(safe-area-inset-top,0px)'}}>
+      <div className="splash-logo">⚡</div>
+      <h1 style={{marginBottom:8}}>FND Tracker</h1>
+      <p style={{color:'var(--muted)',fontSize:14,marginBottom:28,lineHeight:1.6,maxWidth:320}}>
+        One-time setup. You need a free Google Cloud OAuth client ID to enable Drive sync.
+      </p>
+
+      <div style={{width:'100%',maxWidth:380}}>
+        <div className="info-box" style={{marginBottom:16,textAlign:'left'}}>
+          <strong>How to get your Client ID (5 min):</strong><br/>
+          1. Go to <a href="https://console.cloud.google.com" target="_blank">console.cloud.google.com</a><br/>
+          2. Create project → APIs &amp; Services → Enable<br/>
+          &nbsp;&nbsp; <strong>Google Drive API</strong><br/>
+          3. OAuth consent screen → External → App name: FND Tracker<br/>
+          4. Credentials → Create → OAuth client ID → Web application<br/>
+          5. Add your GitHub Pages URL to <strong>Authorised JavaScript origins</strong><br/>
+          6. Copy the <strong>Client ID</strong> (ends in .apps.googleusercontent.com)
+        </div>
+
+        <input
+          style={{width:'100%',background:'var(--card)',border:'1.5px solid var(--border)',borderRadius:12,padding:'14px 16px',color:'var(--text)',fontFamily:'var(--mono)',fontSize:13,outline:'none',marginBottom:12,boxSizing:'border-box'}}
+          placeholder="Paste Client ID here…"
+          value={id} onChange={e=>setId(e.target.value.trim())}
+        />
+        <button className="btn btn-primary btn-full" disabled={!id.includes('googleusercontent')}
+          style={{opacity:id.includes('googleusercontent')?1:.4}}
+          onClick={()=>{localStorage.setItem('fnd_google_client_id',id);onSave(id);}}>
+          Save &amp; Continue →
+        </button>
+        <p style={{color:'var(--muted)',fontSize:11,marginTop:12,textAlign:'center',lineHeight:1.6}}>
+          Stored only on this device. Each device that needs access enters the same Client ID.
+        </p>
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   AUTH SCREEN — Google Sign-In button
+   ═══════════════════════════════════════════════════════════ */
+function AuthScreen({ clientId, onToken }) {
+  const btnRef = useRef();
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    function tryRender() {
+      if (!window.google?.accounts?.id) { setTimeout(tryRender, 200); return; }
+      window.google.accounts.id.initialize({
+        client_id: clientId,
+        callback: () => {},
+        auto_select: false,
+      });
+      // We use the OAuth2 token client for Drive access
+    }
+    tryRender();
+  }, [clientId]);
+
+  function signIn() {
+    setLoading(true);
+    const client = window.google.accounts.oauth2.initTokenClient({
+      client_id: clientId,
+      scope: SCOPES,
+      callback: (resp) => {
+        setLoading(false);
+        if (resp.access_token) {
+          onToken(resp.access_token);
+        } else {
+          toast('Sign-in failed or cancelled', 'var(--red)');
+        }
+      },
+    });
+    client.requestAccessToken();
+  }
+
+  return (
+    <div className="splash fade-in">
+      <div className="splash-logo">⚡</div>
+      <h1 style={{marginBottom:8}}>FND Tracker</h1>
+      <p style={{color:'var(--muted)',fontSize:15,marginBottom:10,lineHeight:1.6}}>
+        Brain-fog-friendly daily check-ins.<br/>Data lives in your Google Drive.
+      </p>
+      <p style={{color:'var(--muted)',fontSize:12,marginBottom:36,lineHeight:1.6,maxWidth:300}}>
+        Sign in to load your data file. Your caregiver signs in too — you share the same Drive file.
+      </p>
+
+      <button className="google-btn" onClick={signIn} disabled={loading}>
+        <svg className="google-icon" viewBox="0 0 24 24">
+          <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+          <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+          <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l2.85-2.22.81-.62z"/>
+          <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+        </svg>
+        {loading ? 'Connecting…' : 'Continue with Google'}
+      </button>
+
+      <p style={{color:'var(--muted)',fontSize:11,marginTop:20,maxWidth:280,lineHeight:1.6}}>
+        Only requests access to files this app creates. Your other Drive files are not accessible.
+      </p>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   DRIVE FILE PICKER — for caregiver to select shared file
+   ═══════════════════════════════════════════════════════════ */
+function DriveFilePicker({ drive, onFile }) {
+  const [files, setFiles] = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    (async () => {
+      try {
+        const r = await drive.req(
+          `https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name,modifiedTime,owners)&spaces=drive`
+        );
+        const d = await r.json();
+        setFiles(d.files || []);
+      } catch(e) {
+        setFiles([]);
+      }
+      setLoading(false);
+    })();
+  }, []);
+
+  return (
+    <div className="splash fade-in">
+      <div className="splash-logo">📁</div>
+      <h2 style={{marginBottom:6}}>Choose your data file</h2>
+      <p style={{color:'var(--muted)',fontSize:13,marginBottom:24,lineHeight:1.6,maxWidth:320}}>
+        We found {loading ? '…' : files?.length || 'no'} FND Tracker file(s) you have access to. Choose one or create a new one.
+      </p>
+      {loading ? <div className="spinner"/> : (
+        <div style={{width:'100%',maxWidth:380}}>
+          {files?.map(f => (
+            <div key={f.id} className="card" style={{marginBottom:10,cursor:'pointer'}} onClick={()=>onFile(f.id)}>
+              <div style={{fontWeight:600,marginBottom:2}}>⚡ {f.name}</div>
+              <div style={{fontSize:12,color:'var(--muted)'}}>Modified {fmt_rel(f.modifiedTime)}</div>
+            </div>
+          ))}
+          <button className="btn btn-green btn-full" style={{marginTop:8}} onClick={()=>onFile(null)}>
+            + Create new data file
+          </button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   CHECK-IN WIZARD
+   ═══════════════════════════════════════════════════════════ */
+function CheckInWizard({ onDone }) {
+  const { saveCheckin, userInfo } = useContext(AppCtx);
+  const [step, setStep] = useState(0);
+  const [data, setData] = useState({ mood:null, symptoms:{}, sleep:7, sleepQuality:null, emotions:[], notes:'' });
+  const [saving, setSaving] = useState(false);
+
+  const steps = ['Mood','Symptoms','Sleep','Feelings'];
+
+  function flareDay() {
+    setData({ ...FLARE_PRESET });
+    setStep(3);
+    toast('⚡ Flare day preset applied', 'var(--red)');
+  }
+
+  function toggleSym(name, val) {
+    setData(p => ({ ...p, symptoms: { ...p.symptoms, [name]: p.symptoms[name]===val ? 0 : val } }));
+  }
+
+  function toggleEmotion(e) {
+    setData(p => ({ ...p, emotions: p.emotions.includes(e) ? p.emotions.filter(x=>x!==e) : [...p.emotions,e] }));
+  }
+
+  async function save() {
+    setSaving(true);
+    const checkin = {
+      id: uid(),
+      timestamp: new Date().toISOString(),
+      userName: userInfo?.name || 'You',
+      userEmail: userInfo?.email || '',
+      ...data
+    };
+    await saveCheckin(checkin);
+    toast('Check-in saved ✓');
+    onDone();
+    setSaving(false);
+  }
+
+  return (
+    <div className="page fade-in">
+      {/* Flare shortcut */}
+      <div className="flare-banner" onClick={flareDay}>
+        <span style={{fontSize:26}}>🔥</span>
+        <div style={{flex:1}}>
+          <div style={{fontSize:14,fontWeight:700,color:'var(--red)'}}>Flare Day</div>
+          <div style={{fontSize:12,color:'#fca5a5',marginTop:1}}>One tap — auto-fills all severe symptoms</div>
+        </div>
+        <span style={{color:'var(--red)',fontSize:18}}>›</span>
+      </div>
+
+      {/* Progress */}
+      <div className="step-track">
+        {steps.map((s,i) => <div key={s} className={`step-pip ${i<step?'done':i===step?'active':''}`}/>)}
+      </div>
+
+      <h2 style={{marginBottom:3}}>{steps[step]}</h2>
+      <p style={{color:'var(--muted)',fontSize:13,marginBottom:18}}>
+        {step===0 && "How are you feeling overall today?"}
+        {step===1 && "Tap any symptoms you have. 1 = mild · 2 = moderate · 3 = severe"}
+        {step===2 && "How did you sleep last night?"}
+        {step===3 && "Emotional state and any notes."}
+      </p>
+
+      {/* Step 0 — Mood */}
+      {step===0 && (
+        <div className="mood-grid">
+          {MOODS.map(m => (
+            <div key={m.score} className={`mood-btn ${data.mood===m.score?'sel':''}`}
+              onClick={()=>setData(p=>({...p,mood:m.score}))}>
+              <span className="mood-emoji">{m.emoji}</span>
+              <span className="mood-label">{m.label}</span>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Step 1 — Symptoms */}
+      {step===1 && (
+        <div>
+          {SYMPTOMS.map(s => (
+            <div key={s} className="sym-row">
+              <span className="sym-name">{s}</span>
+              <div className="sev-group">
+                {[1,2,3].map(n => (
+                  <button key={n} className={`sev-btn s${n} ${data.symptoms[s]===n?'on':''}`}
+                    onClick={()=>toggleSym(s,n)}>{n}</button>
+                ))}
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {/* Step 2 — Sleep */}
+      {step===2 && (
+        <div>
+          <div className="sleep-display">{data.sleep}h</div>
+          <div className="sleep-stepper">
+            <button className="sleep-btn" onClick={()=>setData(p=>({...p,sleep:Math.max(0,p.sleep-.5)}))}>−</button>
+            <button className="sleep-btn" onClick={()=>setData(p=>({...p,sleep:Math.min(14,p.sleep+.5)}))}>+</button>
+          </div>
+          <div className="section-label">Sleep quality</div>
+          <div className="quality-row">
+            {SLEEP_QUALITY.map(q => (
+              <button key={q} className={`quality-btn ${data.sleepQuality===q?'sel':''}`}
+                onClick={()=>setData(p=>({...p,sleepQuality:q}))}>{q}</button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Step 3 — Feelings + notes */}
+      {step===3 && (
+        <div>
+          <div className="section-label">How are you feeling emotionally?</div>
+          <div className="chip-wrap">
+            {EMOTIONS.map(e => (
+              <div key={e} className={`chip ${data.emotions.includes(e)?'sel':''}`}
+                onClick={()=>toggleEmotion(e)}>{e}</div>
+            ))}
+          </div>
+          <div className="section-label" style={{marginTop:18}}>Notes (optional)</div>
+          <textarea placeholder="Anything else to capture…"
+            value={data.notes} onChange={e=>setData(p=>({...p,notes:e.target.value}))}/>
+        </div>
+      )}
+
+      {/* Navigation */}
+      <div style={{display:'flex',gap:10,marginTop:24,marginBottom:8}}>
+        {step>0 && <button className="btn btn-secondary" style={{flex:1}} onClick={()=>setStep(p=>p-1)}>← Back</button>}
+        {step<3
+          ? <button className="btn btn-primary" style={{flex:2}}
+              disabled={step===0&&data.mood===null}
+              onClick={()=>setStep(p=>p+1)}>Next →</button>
+          : <button className="btn btn-green" style={{flex:2}} onClick={save} disabled={saving}>
+              {saving?'Saving…':'✓ Save Check-in'}
+            </button>
+        }
+      </div>
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   HISTORY
+   ═══════════════════════════════════════════════════════════ */
+function HistoryScreen() {
+  const { checkins, deleteCheckin } = useContext(AppCtx);
+  const groups = groupByDay(checkins);
+
+  if (!checkins.length) return (
+    <div className="page" style={{textAlign:'center',paddingTop:60}}>
+      <div style={{fontSize:48,marginBottom:12}}>📋</div>
+      <h3>No check-ins yet</h3>
+      <p style={{color:'var(--muted)',marginTop:8,fontSize:14}}>Tap Check-in to log your first entry.</p>
+    </div>
+  );
+
+  return (
+    <div className="page fade-in">
+      {groups.map(([dateStr, entries]) => {
+        const isFlare = entries.some(e=>Object.values(e.symptoms||{}).some(v=>v>=3));
+        const isGood  = entries.every(e=>(e.mood||3)>=4);
+        return (
+          <div key={dateStr} className={`day-group ${isFlare?'flare':isGood?'good':''}`}>
+            <div className="day-label">{fmt_date(entries[0].timestamp)}</div>
+            {entries.map(entry => {
+              const activeSyms = Object.entries(entry.symptoms||{}).filter(([,v])=>v>0);
+              return (
+                <div key={entry.id} className="entry-card">
+                  <div className="entry-top">
+                    <span className="entry-emoji">{moodEmoji(entry.mood)}</span>
+                    <div className="entry-info">
+                      <div>
+                        <span className="entry-time">{fmt_time(entry.timestamp)}</span>
+                        {entry.userName && <span className="entry-who"> · {entry.userName}</span>}
+                      </div>
+                      {entry.sleepQuality && (
+                        <div style={{fontSize:11,color:'var(--muted)',marginTop:1}}>
+                          😴 {entry.sleep}h · {entry.sleepQuality}
+                        </div>
+                      )}
+                    </div>
+                    <button className="btn btn-ghost btn-sm"
+                      style={{color:'var(--muted)',padding:'4px 8px',minHeight:28}}
+                      onClick={()=>{ if(window.confirm('Delete this check-in?')) deleteCheckin(entry.id); }}>✕</button>
+                  </div>
+                  {activeSyms.length>0 && (
+                    <div className="pill-row">
+                      {activeSyms.slice(0,6).map(([name,sev])=>(
+                        <span key={name} className={`pill ${sev===3?'red':sev===2?'amber':'green'}`}>
+                          {name.split('/')[0].trim()} {sev}
+                        </span>
+                      ))}
+                    </div>
+                  )}
+                  {entry.emotions?.length>0 && (
+                    <div className="pill-row">
+                      {entry.emotions.map(e=><span key={e} className="pill violet">{e}</span>)}
+                    </div>
+                  )}
+                  {entry.notes && <div style={{fontSize:12,color:'var(--muted)',marginTop:8,lineHeight:1.5}}>{entry.notes}</div>}
+                </div>
+              );
+            })}
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   INSIGHTS
+   ═══════════════════════════════════════════════════════════ */
+function InsightsScreen() {
+  const { checkins } = useContext(AppCtx);
+  const now = Date.now();
+  const last30 = checkins.filter(c => now-new Date(c.timestamp).getTime() < 30*86400000);
+
+  if (!last30.length) return (
+    <div className="page" style={{textAlign:'center',paddingTop:60}}>
+      <div style={{fontSize:48,marginBottom:12}}>📊</div>
+      <h3>No data yet</h3>
+      <p style={{color:'var(--muted)',marginTop:8,fontSize:14}}>Log a few check-ins to see trends.</p>
+    </div>
+  );
+
+  const avgMood  = (last30.reduce((s,c)=>s+(c.mood||3),0)/last30.length).toFixed(1);
+  const avgSleep = (last30.reduce((s,c)=>s+(c.sleep||7),0)/last30.length).toFixed(1);
+  const flareDays = last30.filter(c=>Object.values(c.symptoms||{}).some(v=>v>=3)).length;
+  const goodDays  = last30.filter(c=>(c.mood||3)>=4).length;
+
+  // Symptom frequency
+  const symFreq = {};
+  last30.forEach(c=>Object.entries(c.symptoms||{}).forEach(([k,v])=>{ if(v>0) symFreq[k]=(symFreq[k]||0)+1; }));
+  const topSyms = Object.entries(symFreq).sort((a,b)=>b[1]-a[1]).slice(0,5);
+
+  // Emotion frequency
+  const emoFreq = {};
+  last30.forEach(c=>(c.emotions||[]).forEach(e=>{ emoFreq[e]=(emoFreq[e]||0)+1; }));
+  const topEmos = Object.entries(emoFreq).sort((a,b)=>b[1]-a[1]).slice(0,6);
+
+  // 7-day mood trend
+  const trend = Array.from({length:7},(_,i)=>{
+    const d = new Date(); d.setDate(d.getDate()-(6-i));
+    const dayStr = d.toDateString();
+    const dayItems = checkins.filter(c=>new Date(c.timestamp).toDateString()===dayStr);
+    return {
+      lbl: d.toLocaleDateString('en-CA',{weekday:'short'}),
+      avg: dayItems.length ? dayItems.reduce((s,c)=>s+(c.mood||3),0)/dayItems.length : null
+    };
+  });
+
+  return (
+    <div className="page fade-in">
+      <div className="section-label" style={{marginBottom:12}}>Last 30 Days</div>
+
+      <div className="stat-grid">
+        <div className="stat-box"><div className="stat-num">{avgMood}</div><div className="stat-lbl">Avg mood</div></div>
+        <div className="stat-box"><div className="stat-num">{avgSleep}h</div><div className="stat-lbl">Avg sleep</div></div>
+        <div className="stat-box"><div className="stat-num" style={{color:'var(--red)'}}>{flareDays}</div><div className="stat-lbl">Flare days</div></div>
+        <div className="stat-box"><div className="stat-num" style={{color:'var(--green)'}}>{goodDays}</div><div className="stat-lbl">Good days</div></div>
+      </div>
+
+      {/* Mood bar chart */}
+      <div className="card">
+        <div className="section-label" style={{marginBottom:12}}>Mood this week</div>
+        <div style={{display:'flex',alignItems:'flex-end',gap:8,height:72}}>
+          {trend.map((d,i)=>(
+            <div key={i} style={{flex:1,display:'flex',flexDirection:'column',alignItems:'center',gap:4}}>
+              <div style={{
+                width:'100%',
+                height: d.avg ? `${(d.avg/5)*62}px` : '3px',
+                background: d.avg ? `hsl(${(d.avg-1)*25+180},60%,55%)` : 'var(--border)',
+                borderRadius:5, transition:'height .3s'
+              }}/>
+              <span style={{fontSize:10,color:'var(--muted)'}}>{d.lbl}</span>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {topSyms.length>0 && (
+        <div className="card">
+          <div className="section-label" style={{marginBottom:10}}>Most frequent symptoms</div>
+          {topSyms.map(([name,count])=>(
+            <div key={name} style={{marginBottom:10}}>
+              <div style={{display:'flex',justifyContent:'space-between',marginBottom:4}}>
+                <span style={{fontSize:13,fontWeight:500}}>{name}</span>
+                <span style={{fontSize:12,color:'var(--muted)',fontFamily:'var(--mono)'}}>{count}/{last30.length}</span>
+              </div>
+              <div style={{height:5,background:'var(--border)',borderRadius:3,overflow:'hidden'}}>
+                <div style={{height:'100%',width:`${(count/last30.length)*100}%`,background:'var(--accent)',borderRadius:3}}/>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+
+      {topEmos.length>0 && (
+        <div className="card">
+          <div className="section-label" style={{marginBottom:10}}>Common emotions</div>
+          <div className="chip-wrap">
+            {topEmos.map(([e,count])=>(
+              <div key={e} style={{display:'flex',alignItems:'center',gap:5,padding:'5px 12px',borderRadius:20,background:'rgba(129,140,248,.1)',border:'1px solid rgba(129,140,248,.2)'}}>
+                <span style={{fontSize:13,color:'var(--violet)'}}>{e}</span>
+                <span style={{fontSize:11,color:'var(--muted)',fontFamily:'var(--mono)'}}>{count}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   HOME SCREEN
+   ═══════════════════════════════════════════════════════════ */
+function HomeScreen({ onCheckin }) {
+  const { checkins, userInfo, syncStatus, lastSynced, manualSync, offlineCount } = useContext(AppCtx);
+  const today = checkins.filter(c => new Date(c.timestamp).toDateString()===new Date().toDateString());
+  const h = new Date().getHours();
+  const greeting = h<12?'Good morning':h<17?'Good afternoon':'Good evening';
+  const name = userInfo?.name?.split(' ')[0] || 'there';
+
+  return (
+    <div className="page fade-in">
+      <div style={{marginBottom:20}}>
+        <div style={{fontSize:13,color:'var(--muted)',marginBottom:2}}>{greeting},</div>
+        <h1>{name}</h1>
+      </div>
+
+      {/* Today card */}
+      {today.length===0 ? (
+        <div style={{background:'linear-gradient(135deg,#0c1825,#101e36)',border:'1px solid rgba(56,189,248,.18)',borderRadius:var(--radius),padding:22,textAlign:'center',marginBottom:12}}>
+          <div style={{fontSize:34,marginBottom:8}}>📋</div>
+          <h3 style={{marginBottom:6}}>No check-in yet today</h3>
+          <p style={{color:'var(--muted)',fontSize:13,marginBottom:16}}>How are you feeling?</p>
+          <button className="btn btn-primary" onClick={onCheckin} style={{minWidth:200}}>Start Check-in →</button>
+        </div>
+      ) : (
+        <div style={{background:'linear-gradient(135deg,#062318,#063b28)',border:'1px solid rgba(52,211,153,.18)',borderRadius:'var(--radius)',padding:18,marginBottom:12}}>
+          <div style={{display:'flex',alignItems:'center',gap:12,marginBottom:10}}>
+            <span style={{fontSize:30}}>{moodEmoji(today[today.length-1]?.mood)}</span>
+            <div>
+              <div style={{fontWeight:600}}>Checked in today</div>
+              <div style={{fontSize:12,color:'var(--green)'}}>{today.length} entr{today.length===1?'y':'ies'} logged</div>
+            </div>
+          </div>
+          <button className="btn btn-secondary btn-sm" onClick={onCheckin}>Log another →</button>
+        </div>
+      )}
+
+      {/* Sync status */}
+      <div className="card" style={{display:'flex',alignItems:'center',justifyContent:'space-between',padding:'12px 14px'}}>
+        <div style={{display:'flex',alignItems:'center',gap:8}}>
+          <span style={{fontSize:18}}>☁️</span>
+          <div>
+            <div style={{fontSize:13,fontWeight:600}}>Google Drive</div>
+            <div style={{fontSize:11,color:'var(--muted)'}}>
+              {syncStatus==='saving' ? 'Saving to Drive…' :
+               syncStatus==='offline' && offlineCount>0 ? `${offlineCount} check-in${offlineCount!==1?'s':''} queued offline` :
+               syncStatus==='offline' ? 'Offline — data saved locally' :
+               syncStatus==='error'   ? 'Last sync failed — tap to retry' :
+               lastSynced ? `Synced ${fmt_rel(lastSynced)}` : 'Not synced yet'}
+            </div>
+          </div>
+        </div>
+        <button className="btn btn-secondary btn-sm" onClick={manualSync} disabled={syncStatus==='saving'}>
+          <Icons.Refresh/> Sync
+        </button>
+      </div>
+
+      {/* Recent entries */}
+      {checkins.length>0 && (
+        <div style={{marginTop:6}}>
+          <div className="section-label">Recent</div>
+          {checkins.slice(0,4).map(c=>{
+            const sym = Object.values(c.symptoms||{}).filter(v=>v>0).length;
+            return (
+              <div key={c.id} style={{display:'flex',alignItems:'center',gap:12,padding:'10px 0',borderBottom:'1px solid var(--border)'}}>
+                <span style={{fontSize:20}}>{moodEmoji(c.mood)}</span>
+                <div style={{flex:1}}>
+                  <div style={{fontSize:13,fontWeight:500}}>{fmt_date(c.timestamp)}</div>
+                  <div style={{fontSize:11,color:'var(--muted)'}}>{c.userName} · {sym} symptom{sym!==1?'s':''}</div>
+                </div>
+                <span style={{fontSize:11,color:'var(--muted)',fontFamily:'var(--mono)'}}>{fmt_time(c.timestamp)}</span>
+              </div>
+            );
+          })}
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   SETTINGS
+   ═══════════════════════════════════════════════════════════ */
+function SettingsScreen() {
+  const { checkins, userInfo, fileId, driveSync, signOut } = useContext(AppCtx);
+  const [showReport, setShowReport] = useState(false);
+
+  function exportCSV() {
+    const rows = [['Date','Time','User','Mood','Sleep (h)','Sleep Quality','Symptoms','Emotions','Notes']];
+    checkins.forEach(c=>{
+      const d = new Date(c.timestamp);
+      const syms = Object.entries(c.symptoms||{}).filter(([,v])=>v>0).map(([k,v])=>`${k}:${v}`).join('; ');
+      rows.push([
+        d.toLocaleDateString('en-CA'),
+        d.toLocaleTimeString('en-CA',{hour12:false}),
+        c.userName||'',
+        c.mood||'',
+        c.sleep||'',
+        c.sleepQuality||'',
+        syms,
+        (c.emotions||[]).join('; '),
+        c.notes||''
+      ]);
+    });
+    const csv = rows.map(r=>r.map(v=>`"${String(v).replace(/"/g,'""')}"`).join(',')).join('\n');
+    const a = document.createElement('a');
+    a.href = 'data:text/csv;charset=utf-8,'+encodeURIComponent(csv);
+    a.download = `fnd-tracker-${new Date().toISOString().slice(0,10)}.csv`;
+    a.click();
+    toast('CSV exported ✓');
+  }
+
+  const last30 = checkins.filter(c=>Date.now()-new Date(c.timestamp).getTime()<30*86400000);
+  const avgMood = last30.length?(last30.reduce((s,c)=>s+(c.mood||3),0)/last30.length).toFixed(1):'—';
+  const flareDays = last30.filter(c=>Object.values(c.symptoms||{}).some(v=>v>=3)).length;
+  const symFreq = {};
+  last30.forEach(c=>Object.entries(c.symptoms||{}).forEach(([k,v])=>{if(v>0)symFreq[k]=(symFreq[k]||0)+1;}));
+  const topSyms = Object.entries(symFreq).sort((a,b)=>b[1]-a[1]).slice(0,5);
+
+  return (
+    <div className="page fade-in">
+      {/* User */}
+      <div className="card" style={{display:'flex',alignItems:'center',gap:12}}>
+        {userInfo?.picture && <img src={userInfo.picture} style={{width:44,height:44,borderRadius:'50%'}} alt=""/>}
+        <div style={{flex:1}}>
+          <div style={{fontWeight:600}}>{userInfo?.name||'Signed in'}</div>
+          <div style={{fontSize:12,color:'var(--muted)'}}>{userInfo?.email}</div>
+        </div>
+        <button className="btn btn-sm btn-secondary" onClick={signOut}>Sign out</button>
+      </div>
+
+      {/* Drive info */}
+      <div className="card">
+        <div className="section-label">Google Drive</div>
+        <div style={{fontSize:13,color:'var(--muted)',marginBottom:8,lineHeight:1.6}}>
+          Your data is stored in <strong style={{color:'var(--text)'}}>fnd-tracker-data.json</strong> in your Drive.
+        </div>
+        <div style={{display:'flex',alignItems:'center',gap:6,fontSize:12,color:'var(--muted)'}}>
+          <Icons.Drive/>
+          <span>File ID: <span style={{fontFamily:'var(--mono)',fontSize:11}}>{fileId?.slice(0,16)}…</span></span>
+        </div>
+        <div className="info-box" style={{marginTop:12,marginBottom:0}}>
+          <strong>To share with your caregiver:</strong> Go to Google Drive, find <em>fnd-tracker-data.json</em>, right-click → Share → enter their email with Editor access. They sign into FND Tracker with their Google account and select that file.
+        </div>
+      </div>
+
+      {/* Export */}
+      <div className="card">
+        <div className="section-label">Export &amp; Reports</div>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 0',borderBottom:'1px solid var(--border)'}}>
+          <div>
+            <div style={{fontSize:14,fontWeight:500}}>Export CSV</div>
+            <div style={{fontSize:12,color:'var(--muted)'}}>All {checkins.length} check-ins</div>
+          </div>
+          <button className="btn btn-sm btn-secondary" onClick={exportCSV}>Export</button>
+        </div>
+        <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',padding:'10px 0'}}>
+          <div>
+            <div style={{fontSize:14,fontWeight:500}}>Doctor Report</div>
+            <div style={{fontSize:12,color:'var(--muted)'}}>30-day summary</div>
+          </div>
+          <button className="btn btn-sm btn-secondary" onClick={()=>setShowReport(true)}>View</button>
+        </div>
+      </div>
+
+      {/* Doctor report modal */}
+      {showReport && (
+        <div className="modal-backdrop" onClick={e=>e.target===e.currentTarget&&setShowReport(false)}>
+          <div className="modal">
+            <div style={{display:'flex',justifyContent:'space-between',alignItems:'center',marginBottom:16}}>
+              <h2>Doctor Report</h2>
+              <button className="btn btn-ghost btn-sm" onClick={()=>setShowReport(false)}>✕</button>
+            </div>
+            <div style={{fontSize:13,color:'var(--muted)',marginBottom:16}}>
+              {userInfo?.name} · Generated {new Date().toLocaleDateString('en-CA')}
+            </div>
+            <div className="stat-grid" style={{marginBottom:16}}>
+              <div className="stat-box"><div className="stat-num">{last30.length}</div><div className="stat-lbl">Check-ins</div></div>
+              <div className="stat-box"><div className="stat-num">{avgMood}</div><div className="stat-lbl">Avg mood</div></div>
+              <div className="stat-box"><div className="stat-num" style={{color:'var(--red)'}}>{flareDays}</div><div className="stat-lbl">Flare days</div></div>
+            </div>
+            {topSyms.length>0 && (
+              <div style={{marginBottom:16}}>
+                <div className="section-label">Top symptoms (30 days)</div>
+                {topSyms.map(([name,count])=>(
+                  <div key={name} style={{display:'flex',justifyContent:'space-between',padding:'6px 0',borderBottom:'1px solid var(--border)',fontSize:14}}>
+                    <span>{name}</span>
+                    <span style={{color:'var(--muted)'}}>{count}/{last30.length} days</span>
+                  </div>
+                ))}
+              </div>
+            )}
+            <div style={{display:'flex',gap:10}}>
+              <button className="btn btn-primary" style={{flex:1}} onClick={()=>window.print()}>🖨 Print / PDF</button>
+              <button className="btn btn-secondary btn-sm" onClick={exportCSV}>CSV</button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   OFFLINE QUEUE HELPERS
+   Check-ins written while offline are held in localStorage
+   under 'fnd_offline_queue' as a JSON array.
+   On reconnect they are merged into Drive safely.
+   ═══════════════════════════════════════════════════════════ */
+const QUEUE_KEY = 'fnd_offline_queue';
+
+function loadQueue() {
+  try { return JSON.parse(localStorage.getItem(QUEUE_KEY) || '[]'); } catch { return []; }
+}
+function saveQueue(q) {
+  localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+}
+function clearQueue() {
+  localStorage.removeItem(QUEUE_KEY);
+}
+
+// Merge any number of check-in arrays by unique ID, sort newest-first
+function mergeAllCheckins(...arrays) {
+  const seen = new Set();
+  return arrays.flat().filter(c => {
+    if (!c?.id || seen.has(c.id)) return false;
+    seen.add(c.id);
+    return true;
+  }).sort((a,b) => new Date(b.timestamp) - new Date(a.timestamp));
+}
+
+/* ═══════════════════════════════════════════════════════════
+   MAIN APP — orchestrates Drive sync + all screens
+   ═══════════════════════════════════════════════════════════ */
+function MainApp({ token, userInfo, fileId, initialData, driveInstance }) {
+  // Merge initial Drive data with anything already in the offline queue
+  // (handles the case where the user logged in, added entries, then the
+  // app reloaded before a sync completed)
+  const initCheckins = mergeAllCheckins(
+    initialData?.checkins || [],
+    loadQueue()
+  );
+
+  const [checkins, setCheckins] = useState(initCheckins);
+  const [tab, setTab] = useState('home');
+  const [syncStatus, setSyncStatus] = useState('synced');
+  const [lastSynced, setLastSynced]   = useState(new Date().toISOString());
+  const [offlineCount, setOfflineCount] = useState(loadQueue().length);
+  const isSyncing = useRef(false);
+  const syncTimer = useRef(null);
+
+  // ── Core merge-and-write: read Drive → merge → write back ──────────
+  // This is the ONLY function that writes to Drive.
+  // It always reads the current Drive state first to avoid overwriting
+  // entries made on another device while this one was offline.
+  const syncToDrive = useCallback(async (localCheckins) => {
+    if (isSyncing.current) return;
+    if (!navigator.onLine) {
+      setSyncStatus('offline');
+      return;
+    }
+    isSyncing.current = true;
+    setSyncStatus('saving');
+    try {
+      // 1. Read what Drive currently has
+      const remote = await driveInstance.readFile(fileId);
+      const remoteCheckins = remote?.checkins || [];
+
+      // 2. Load the offline queue (entries made while offline)
+      const queued = loadQueue();
+
+      // 3. Three-way merge: Drive + local state + offline queue
+      //    Deduplication by ID ensures nothing is doubled or lost
+      const merged = mergeAllCheckins(remoteCheckins, localCheckins, queued);
+
+      // 4. Write the merged result back to Drive
+      const payload = { ...remote, checkins: merged, lastModified: new Date().toISOString() };
+      await driveInstance.writeFile(fileId, payload);
+
+      // 5. Clear the offline queue — everything is now in Drive
+      clearQueue();
+      setOfflineCount(0);
+
+      // 6. Update local state to the merged truth
+      setCheckins(merged);
+      setLastSynced(new Date().toISOString());
+      setSyncStatus('synced');
+    } catch(e) {
+      setSyncStatus('error');
+      // Don't discard data — leave offline queue intact for next attempt
+    }
+    isSyncing.current = false;
+  }, [fileId, driveInstance]);
+
+  // ── Schedule a sync (debounced 4s) ─────────────────────────────────
+  const scheduleSync = useCallback((latestCheckins) => {
+    clearTimeout(syncTimer.current);
+    setSyncStatus(navigator.onLine ? 'stale' : 'offline');
+    syncTimer.current = setTimeout(() => syncToDrive(latestCheckins), 4000);
+  }, [syncToDrive]);
+
+  // ── Sync on reconnect ───────────────────────────────────────────────
+  useEffect(() => {
+    const handleOnline = () => {
+      setSyncStatus('stale');
+      // Flush immediately when connectivity returns
+      setCheckins(current => {
+        syncToDrive(current);
+        return current;
+      });
+    };
+    const handleOffline = () => setSyncStatus('offline');
+    window.addEventListener('online',  handleOnline);
+    window.addEventListener('offline', handleOffline);
+    return () => {
+      window.removeEventListener('online',  handleOnline);
+      window.removeEventListener('offline', handleOffline);
+    };
+  }, [syncToDrive]);
+
+  // ── Sync on app foreground (handles long offline periods) ───────────
+  useEffect(() => {
+    const handleVisible = () => {
+      if (document.visibilityState === 'visible' && navigator.onLine) {
+        setCheckins(current => { syncToDrive(current); return current; });
+      }
+    };
+    document.addEventListener('visibilitychange', handleVisible);
+    return () => document.removeEventListener('visibilitychange', handleVisible);
+  }, [syncToDrive]);
+
+  // ── Save a new check-in ─────────────────────────────────────────────
+  function saveCheckin(entry) {
+    const next = [entry, ...checkins];
+    setCheckins(next);
+
+    if (!navigator.onLine) {
+      // Save to offline queue so it survives a page reload
+      const q = loadQueue();
+      q.push(entry);
+      saveQueue(q);
+      setOfflineCount(q.length);
+      setSyncStatus('offline');
+      toast('Saved locally — will sync when online', 'var(--amber)');
+    } else {
+      scheduleSync(next);
+    }
+  }
+
+  // ── Delete a check-in ───────────────────────────────────────────────
+  function deleteCheckin(id) {
+    const next = checkins.filter(c=>c.id!==id);
+    setCheckins(next);
+    // Also remove from offline queue if it was queued but never synced
+    const q = loadQueue().filter(c=>c.id!==id);
+    saveQueue(q);
+    setOfflineCount(q.length);
+    if (navigator.onLine) scheduleSync(next);
+    toast('Deleted', 'var(--amber)');
+  }
+
+  // ── Manual sync button ──────────────────────────────────────────────
+  function manualSync() {
+    setCheckins(current => {
+      syncToDrive(current).then(() => toast('Synced ✓'));
+      return current;
+    });
+  }
+
+  function signOut() {
+    if (!window.confirm('Sign out?')) return;
+    clearTimeout(syncTimer.current);
+    localStorage.removeItem('fnd_token');
+    localStorage.removeItem('fnd_file_id');
+    window.location.reload();
+  }
+
+  const syncDotState = syncStatus==='saving'?'saving'
+    : syncStatus==='stale'  ?'stale'
+    : syncStatus==='offline'?'offline'
+    : syncStatus==='error'  ?'offline'
+    : '';
+
+  const ctx = { checkins, saveCheckin, deleteCheckin, manualSync, userInfo, fileId, driveSync:driveInstance, signOut, syncStatus, lastSynced, offlineCount };
+
+  const navItems = [
+    { id:'home',     label:'Home',    Icon:Icons.Home    },
+    { id:'checkin',  label:'Check-in',Icon:Icons.Plus    },
+    { id:'history',  label:'History', Icon:Icons.List    },
+    { id:'insights', label:'Insights',Icon:Icons.Chart   },
+    { id:'settings', label:'Settings',Icon:Icons.Settings},
+  ];
+
+  const syncLabel = syncStatus==='saving'  ? 'Saving…'
+    : syncStatus==='offline' ? (offlineCount>0 ? `${offlineCount} queued` : 'Offline')
+    : syncStatus==='error'   ? 'Sync error'
+    : syncStatus==='stale'   ? 'Pending'
+    : 'Drive ✓';
+
+  return (
+    <AppCtx.Provider value={ctx}>
+      {/* Top bar */}
+      <div className="topbar">
+        <div className="topbar-logo">
+          <div className="logo-bolt">⚡</div>
+          FND Tracker
+        </div>
+        <div className="sync-pill" onClick={manualSync} title="Tap to sync now">
+          <div className={`sync-dot ${syncDotState}`}/>
+          <span>{syncLabel}</span>
+        </div>
+      </div>
+
+      {/* Content */}
+      <div className="scroll-area">
+        {tab==='home'     && <HomeScreen onCheckin={()=>setTab('checkin')}/>}
+        {tab==='checkin'  && <CheckInWizard onDone={()=>setTab('home')}/>}
+        {tab==='history'  && <HistoryScreen/>}
+        {tab==='insights' && <InsightsScreen/>}
+        {tab==='settings' && <SettingsScreen/>}
+      </div>
+
+      {/* Bottom nav */}
+      <nav className="bottom-nav">
+        {navItems.map(n=>(
+          <button key={n.id} className={`nav-item ${tab===n.id?'active':''}`} onClick={()=>setTab(n.id)}>
+            <n.Icon/>
+            <span>{n.label}</span>
+          </button>
+        ))}
+      </nav>
+    </AppCtx.Provider>
+  );
+}
+
+/* ═══════════════════════════════════════════════════════════
+   ROOT — top-level auth + Drive init state machine
+   ═══════════════════════════════════════════════════════════ */
+function Root() {
+  const [clientId, setClientId] = useState(localStorage.getItem('fnd_google_client_id') || '');
+  const [token, setToken]       = useState(null);
+  const [userInfo, setUserInfo] = useState(null);
+  const [fileId, setFileId]     = useState(localStorage.getItem('fnd_file_id') || null);
+  const [driveData, setDriveData]       = useState(null);
+  const [driveInstance, setDriveInstance] = useState(null);
+  const [status, setStatus]     = useState('idle'); // idle|loading|file-pick|ready|error
+  const [errorMsg, setErrorMsg] = useState('');
+
+  async function handleToken(accessToken) {
+    setToken(accessToken);
+    setStatus('loading');
+    try {
+      // Get user info
+      const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo', {
+        headers: { Authorization: `Bearer ${accessToken}` }
+      });
+      const info = await r.json();
+      setUserInfo(info);
+
+      const drive = new DriveSync(accessToken);
+      setDriveInstance(drive);
+
+      // If we have a remembered file ID, load it directly
+      if (fileId) {
+        try {
+          const data = await drive.readFile(fileId);
+          setDriveData(data);
+          setStatus('ready');
+          return;
+        } catch(e) {
+          // File may have been deleted or unshared — fall through to pick
+          localStorage.removeItem('fnd_file_id');
+          setFileId(null);
+        }
+      }
+
+      // Otherwise init (find or create)
+      const { fileId: fid, data, isNew } = await drive.init();
+      localStorage.setItem('fnd_file_id', fid);
+      setFileId(fid);
+      setDriveData(data);
+      setStatus('ready');
+      if (isNew) toast('New data file created in Drive 🎉');
+    } catch(e) {
+      setErrorMsg(e.message);
+      setStatus('error');
+    }
+  }
+
+  async function handleFilePick(pickedId) {
+    setStatus('loading');
+    try {
+      if (!pickedId) {
+        const emptyData = { checkins:[], version:1, createdAt:new Date().toISOString() };
+        const id = await driveInstance.createFile(emptyData);
+        localStorage.setItem('fnd_file_id', id);
+        setFileId(id);
+        setDriveData(emptyData);
+      } else {
+        const data = await driveInstance.readFile(pickedId);
+        localStorage.setItem('fnd_file_id', pickedId);
+        setFileId(pickedId);
+        setDriveData(data);
+      }
+      setStatus('ready');
+    } catch(e) {
+      setErrorMsg(e.message);
+      setStatus('error');
+    }
+  }
+
+  if (!clientId) return <ClientIdSetup onSave={setClientId}/>;
+  if (!token)   return <AuthScreen clientId={clientId} onToken={handleToken}/>;
+  if (status==='loading') return <div className="loader"><div className="spinner"/><span>Loading Drive data…</span></div>;
+  if (status==='error')   return (
+    <div className="splash">
+      <div style={{fontSize:40,marginBottom:12}}>⚠️</div>
+      <h2 style={{marginBottom:8}}>Something went wrong</h2>
+      <p style={{color:'var(--muted)',fontSize:14,marginBottom:20,maxWidth:280,lineHeight:1.6}}>{errorMsg}</p>
+      <button className="btn btn-secondary" onClick={()=>{setToken(null);setStatus('idle');}}>← Try again</button>
+    </div>
+  );
+  if (status==='file-pick') return <DriveFilePicker drive={driveInstance} onFile={handleFilePick}/>;
+  if (status==='ready') return <MainApp token={token} userInfo={userInfo} fileId={fileId} initialData={driveData} driveInstance={driveInstance}/>;
+
+  return <div className="loader"><div className="spinner"/></div>;
+}
+
+/* ── Mount ── */
+const root = ReactDOM.createRoot(document.getElementById('root'));
+root.render(<Root/>);
+</script>
+
+<!-- Service worker registration -->
+<script>
+if ('serviceWorker' in navigator) {
+  window.addEventListener('load', () => {
+    navigator.serviceWorker.register('./sw.js').catch(()=>{});
+  });
+}
+</script>
+</body>
+</html>
