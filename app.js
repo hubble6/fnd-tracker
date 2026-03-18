@@ -1717,11 +1717,28 @@ function App(){
         syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
         return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
     };
-    const onOnline=()=>{setSyncStatus('stale');triggerSync();};
+    const onOnline=()=>{
+      setSyncStatus('stale');
+      // If GSI wasn't loaded when the app opened (was offline), try loading it now
+      if(!window.google?.accounts?.oauth2){
+        const script=document.createElement('script');
+        script.src='https://accounts.google.com/gsi/client';
+        script.onload=()=>{
+          setGsiReady(true);
+          tryRefreshToken();  // fire token refresh as soon as GSI loads
+        };
+        document.head.appendChild(script);
+      } else {
+        // GSI already loaded — just get a fresh token then sync
+        tryRefreshToken();
+      }
+      triggerSync();
+    };
     const onOffline=()=>setSyncStatus('offline');
     window.addEventListener('online',onOnline);
     window.addEventListener('offline',onOffline);
     return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);};
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[syncToDrive]);
 
   // ── Token handler ─────────────────────────────────────────
