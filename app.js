@@ -6,6 +6,7 @@ const { useState, useEffect, useCallback, useRef, useMemo } = React;
 const DRIVE_FILE_NAME = 'fnd-tracker-data.json';
 const SCOPES = 'https://www.googleapis.com/auth/drive.file openid email profile';
 const QUEUE_KEY = 'fnd_offline_queue';
+const SHARED_FILE_KEY = 'fnd_shared_file_id'; // caregiver sets this to share a file
 
 function loadQueue() { try { return JSON.parse(localStorage.getItem(QUEUE_KEY)||'[]'); } catch { return []; } }
 function saveQueue(q) { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); }
@@ -51,14 +52,26 @@ class DriveSync {
     return r;
   }
   async findFile() {
-    // Search own drive first
-    const r1 = await this.req(`https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name,modifiedTime)&spaces=drive`);
-    const d1 = await r1.json();
-    if(d1.files?.[0]) return d1.files[0];
-    // Also search sharedWithMe (for the caregiver's account)
-    const r2 = await this.req(`https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false and sharedWithMe=true&fields=files(id,name,modifiedTime)&spaces=drive`);
-    const d2 = await r2.json();
-    return d2.files?.[0] || null;
+    // Search all drives including shared-with-me files
+    // includeItemsFromAllDrives + corpora=allDrives finds shared files too
+    const params = new URLSearchParams({
+      q: `name='${DRIVE_FILE_NAME}' and trashed=false`,
+      fields: 'files(id,name,modifiedTime)',
+      includeItemsFromAllDrives: 'true',
+      supportsAllDrives: 'true',
+      corpora: 'allDrives',
+    });
+    try {
+      const r = await this.req(`https://www.googleapis.com/drive/v3/files?${params}`);
+      const d = await r.json();
+      if(d.files?.[0]) return d.files[0];
+    } catch(e) {}
+    // Fallback: search only own drive
+    try {
+      const r2 = await this.req(`https://www.googleapis.com/drive/v3/files?q=name='${DRIVE_FILE_NAME}' and trashed=false&fields=files(id,name,modifiedTime)&spaces=drive`);
+      const d2 = await r2.json();
+      return d2.files?.[0] || null;
+    } catch(e) { return null; }
   }
   async createFile(data) {
     const form = new FormData();
@@ -1110,7 +1123,7 @@ function buildReport(events,meds,food){
 /* ═══════════════════════════════════════════════════════════
    EXPORT TAB (includes Import)
    ═══════════════════════════════════════════════════════════ */
-function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut}){
+function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut,showFlash}){
   const[confirmReset,setConfirmReset]=useState(false);
   const[confirmSignOut,setConfirmSignOut]=useState(false);
   const[importState,setImportState]=useState(null);
@@ -1351,6 +1364,31 @@ function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut}){
           <Btn onClick={()=>setConfirmSignOut(true)} variant="secondary" fullWidth>Sign Out</Btn>
         )}
       </div>
+
+      {/* Shared File ID — for caregiver device to connect to owner's Drive file */}
+      {(()=>{
+        const[sharedId,setSharedId]=useState(localStorage.getItem('fnd_shared_file_id')||'');
+        const[saved,setSaved]=useState(!!localStorage.getItem('fnd_shared_file_id'));
+        return(
+          <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
+            <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.07em",marginBottom:6}}>Shared Drive File</div>
+            <div style={{color:C.muted,fontSize:12,marginBottom:10,lineHeight:1.5}}>If someone shared their Drive file with you, paste the file ID here so both devices sync to the same data.</div>
+            <input
+              style={{...IS,marginBottom:8,fontSize:12,fontFamily:"monospace"}}
+              placeholder="Paste Google Drive file ID…"
+              value={sharedId}
+              onChange={e=>{ setSharedId(e.target.value.trim()); setSaved(false); }}
+            />
+            <div style={{display:"flex",gap:8}}>
+              <Btn onClick={()=>{ localStorage.setItem('fnd_shared_file_id',sharedId); setSaved(true); showFlash&&showFlash('File ID saved — sign out and back in to connect'); }} disabled={!sharedId||saved} fullWidth small>
+                {saved?'✓ Saved':'Save File ID'}
+              </Btn>
+              {saved&&<Btn onClick={()=>{ localStorage.removeItem('fnd_shared_file_id'); setSharedId(''); setSaved(false); }} variant="secondary" small>Clear</Btn>}
+            </div>
+            {saved&&<div style={{color:C.green,fontSize:11,marginTop:6}}>✓ Connected — sign out and back in to load shared data</div>}
+          </div>
+        );
+      })()}
 
       {/* Reset */}
       <div style={{background:"#0d0505",border:`1px solid ${confirmReset?"#dc2626":"#3f1a1a"}`,borderRadius:12,padding:16}}>
@@ -1602,13 +1640,39 @@ function App(){
 
   // ── Token handler: sign-in button ─────────────────────────
   const handleToken = useCallback(async (accessToken)=>{
-    // Load from Drive first
     const drive = new DriveSync(accessToken);
     driveRef.current=drive; setToken(accessToken); setDriveInstance(drive);
     try{
-      let fid = fileIdRef.current; let data;
-      if(fid){ try{data=await drive.readFile(fid);}catch(e){localStorage.removeItem('fnd_file_id');fileIdRef.current=null;fid=null;} }
-      if(!fid){ const r=await drive.init();fid=r.fileId;data=r.data;localStorage.setItem('fnd_file_id',fid);setFileId(fid);fileIdRef.current=fid;if(r.isNew)showFlash('New data file created in Drive 🎉'); }
+      // Priority order for finding the file:
+      // 1. Stored file ID from a previous session (most reliable)
+      // 2. Manually entered shared file ID (for caregiver's device)
+      // 3. Search Drive by filename (finds own + shared files)
+      // 4. Create a new file (only if nothing found)
+      let fid = fileIdRef.current || localStorage.getItem(SHARED_FILE_KEY) || null;
+      let data;
+
+      if(fid){
+        try{
+          data = await drive.readFile(fid);
+          // Successfully read — save this ID for future sessions
+          localStorage.setItem('fnd_file_id', fid);
+          setFileId(fid); fileIdRef.current=fid;
+        }catch(e){
+          // File ID didn't work — fall through to search
+          localStorage.removeItem('fnd_file_id');
+          localStorage.removeItem(SHARED_FILE_KEY);
+          fileIdRef.current=null; fid=null;
+        }
+      }
+
+      if(!fid){
+        const result = await drive.init(); // searches then creates if not found
+        fid=result.fileId; data=result.data;
+        localStorage.setItem('fnd_file_id',fid);
+        setFileId(fid); fileIdRef.current=fid;
+        if(result.isNew) showFlash('New data file created in Drive 🎉');
+      }
+
       const q=loadQueue(); const qEvts=q.filter(x=>!x._type); const byId=x=>x.id;
       const snap={
         events:mergeByKey(data.events||[],qEvts,byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
@@ -1626,7 +1690,6 @@ function App(){
       setSyncStatus('synced');
     }catch(e){ setSyncStatus('offline'); }
 
-    // Fetch user info — but save a session regardless so the app works offline next open
     let sessionInfo = {name:'User', email:'', picture:''};
     try{
       const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo',
@@ -1634,8 +1697,7 @@ function App(){
       if(r.ok) sessionInfo = await r.json();
     }catch(e){}
     setUserInfo(sessionInfo);
-    saveSession(sessionInfo);   // ← always saved, even if userinfo fetch fails
-
+    saveSession(sessionInfo);
     setAuthStatus('ready');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
@@ -1945,7 +2007,7 @@ function App(){
       {tab==="home"&&homeContent}
       {tab==="trends"&&<TrendsTab events={events} food={food}/>}
       {tab==="log"&&<LogTab events={events} pending={pending} meds={meds} food={food} delEvent={delEvent} delPending={delPending} delMed={delMed} delFood={delFood} setEditing={setEditing} approveAll={approveAll}/>}
-      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} onImport={handleImport} userInfo={userInfo} onSignOut={signOut}/>}
+      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} onImport={handleImport} userInfo={userInfo} onSignOut={signOut} showFlash={showFlash}/>}
     </>
   );
 
