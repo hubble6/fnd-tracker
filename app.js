@@ -42,6 +42,8 @@ function loadSession() {
 function clearSession() {
   localStorage.removeItem(SESSION_KEY);
   localStorage.removeItem(LOCAL_DATA_KEY);
+  // NOTE: deliberately keep fnd_file_id and fnd_shared_file_id
+  // so the next sign-in reconnects to the same Drive file
 }
 
 class DriveSync {
@@ -1654,13 +1656,11 @@ function App(){
       if(fid){
         try{
           data = await drive.readFile(fid);
-          // Successfully read — save this ID for future sessions
           localStorage.setItem('fnd_file_id', fid);
           setFileId(fid); fileIdRef.current=fid;
         }catch(e){
-          // File ID didn't work — fall through to search
+          // File ID didn't work — clear only the cached ID, keep shared ID for next attempt
           localStorage.removeItem('fnd_file_id');
-          localStorage.removeItem(SHARED_FILE_KEY);
           fileIdRef.current=null; fid=null;
         }
       }
@@ -1842,7 +1842,7 @@ function App(){
     }
     // Clear all local state — this is what actually signs out
     clearSession();
-    localStorage.removeItem('fnd_file_id');
+    // Keep fnd_file_id and fnd_shared_file_id so next sign-in finds the same file
     window.location.reload();
   };
 
