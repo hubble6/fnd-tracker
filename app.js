@@ -23,10 +23,20 @@ function loadLocalSnapshot() {
   try { return JSON.parse(localStorage.getItem(LOCAL_DATA_KEY)||'null'); } catch { return null; }
 }
 function saveSession(info) {
-  try { localStorage.setItem(SESSION_KEY, JSON.stringify(info)); } catch(e) {}
+  try {
+    if(!info || typeof info !== 'object') return;
+    localStorage.setItem(SESSION_KEY, JSON.stringify(info));
+  } catch(e) {}
 }
 function loadSession() {
-  try { return JSON.parse(localStorage.getItem(SESSION_KEY)||'null'); } catch { return null; }
+  try {
+    const raw = localStorage.getItem(SESSION_KEY);
+    if(!raw) return null;
+    const parsed = JSON.parse(raw);
+    // Must be a non-null object to count as a valid session
+    if(!parsed || typeof parsed !== 'object') return null;
+    return parsed;
+  } catch { return null; }
 }
 function clearSession() {
   localStorage.removeItem(SESSION_KEY);
@@ -1473,117 +1483,57 @@ function App(){
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
-  // ── getToken: lazily acquire a Drive token when needed ────
-  // Called only when online and a sync is required.
-  // Returns a token string or null if it can't get one silently.
-  const getToken = useCallback(()=> new Promise((resolve)=>{
-    if(!navigator.onLine){ resolve(null); return; }
-    const cid = localStorage.getItem('fnd_google_client_id');
-    if(!cid){ resolve(null); return; }
-    const tryGet = ()=>{
-      if(!window.google?.accounts?.oauth2){ resolve(null); return; }
-      try{
-        window.google.accounts.oauth2.initTokenClient({
-          client_id: cid,
-          scope: 'https://www.googleapis.com/auth/drive.file openid email profile',
-          prompt: 'none',
-          callback: (resp)=>{ resolve(resp?.access_token||null); },
-          error_callback: ()=>{ resolve(null); }
-        }).requestAccessToken();
-      }catch(e){ resolve(null); }
-    };
-    if(window.google?.accounts?.oauth2){
-      tryGet();
-    } else {
-      // GSI not loaded yet — load it then try
-      const existing = document.querySelector('script[src*="accounts.google.com/gsi"]');
-      if(!existing){
-        const s = document.createElement('script');
-        s.src = 'https://accounts.google.com/gsi/client';
-        s.onload = tryGet;
-        s.onerror = ()=>resolve(null);
-        document.head.appendChild(s);
-      } else {
-        // Script tag exists but not loaded yet — poll briefly
-        let i=0;
-        const t=setInterval(()=>{
-          if(window.google?.accounts?.oauth2){ clearInterval(t); tryGet(); }
-          else if(++i>20){ clearInterval(t); resolve(null); }
-        },200);
-      }
-    }
-  }),[]);
-
-  // ── syncWithDrive: get token + sync, called explicitly ────
-  // This is the ONLY place we talk to Google. Never called at boot.
+  // ── syncWithDrive: sync to Drive using the existing token ─
+  // Never requests a new token. If no drive instance exists,
+  // sets syncStatus='needs-reauth' so the UI shows a button.
+  // This function will NEVER open a browser tab or touch Google auth.
   const syncWithDrive = useCallback(async (localState)=>{
     if(!navigator.onLine){ setSyncStatus('offline'); return; }
     if(isSyncing.current) return;
+    if(!driveRef.current){ setSyncStatus('needs-reauth'); return; }
+
     isSyncing.current=true; setSyncStatus('saving');
     try{
-      // Get (or reuse) a token
-      let drive = driveRef.current;
-      if(!drive){
-        const token = await getToken();
-        if(!token){ setSyncStatus('error'); isSyncing.current=false; return; }
-        drive = new DriveSync(token);
-        driveRef.current = drive;
-        setToken(token);
-        setDriveInstance(drive);
-      }
-
-      // Ensure we have a file ID
+      const drive = driveRef.current;
       let fid = fileIdRef.current;
       if(!fid){
         const result = await drive.init();
-        fid = result.fileId;
-        localStorage.setItem('fnd_file_id', fid);
-        setFileId(fid); fileIdRef.current = fid;
+        fid=result.fileId;
+        localStorage.setItem('fnd_file_id',fid);
+        setFileId(fid); fileIdRef.current=fid;
         if(result.isNew) showFlash('New data file created in Drive 🎉');
       }
 
-      // Read remote, merge, write
       let remote;
       try{ remote = await drive.readFile(fid); }
       catch(e){
-        // File missing or token expired — reset file ID and retry once
-        localStorage.removeItem('fnd_file_id'); fileIdRef.current=null; fid=null;
+        // Token expired — clear and flag for manual re-auth
         driveRef.current=null; setDriveInstance(null);
-        const token2 = await getToken();
-        if(!token2){ setSyncStatus('error'); isSyncing.current=false; return; }
-        drive = new DriveSync(token2);
-        driveRef.current=drive; setToken(token2); setDriveInstance(drive);
-        const result = await drive.init();
-        fid=result.fileId; localStorage.setItem('fnd_file_id',fid);
-        setFileId(fid); fileIdRef.current=fid;
-        remote = result.data;
+        setSyncStatus('needs-reauth');
+        return;
       }
 
-      const byId = x=>x.id;
-      const mergeInto = (local,rem,kfn)=>{
-        const ids = new Set(local.map(kfn));
-        return [...local, ...rem.filter(x=>x&&!ids.has(kfn(x)))];
+      const byId=x=>x.id;
+      const mergeInto=(local,rem)=>{
+        const ids=new Set(local.map(byId));
+        return [...local,...rem.filter(x=>x&&!ids.has(byId(x)))];
       };
-      const q = loadQueue();
-      const qEvts = q.filter(x=>!x._type);
-
-      const merged = {
-        events:   mergeInto(localState.events||[],[...(remote.events||[]),...qEvts],byId)
-                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+      const q=loadQueue();
+      const qEvts=q.filter(x=>!x._type);
+      const merged={
+        events:   mergeInto(localState.events||[]  ,[...(remote.events||[]),...qEvts]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
         pending:  [...(localState.pending||[])],
-        meds:     mergeInto(localState.meds||[],remote.meds||[],byId)
-                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        food:     mergeInto(localState.food||[],remote.food||[],byId)
-                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        medLib:   mergeInto(localState.medLib||[],remote.medLib||[],byId),
-        foodLib:  mergeInto(localState.foodLib||[],remote.foodLib||[],byId),
+        meds:     mergeInto(localState.meds||[]    ,remote.meds||[]    ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        food:     mergeInto(localState.food||[]    ,remote.food||[]    ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        medLib:   mergeInto(localState.medLib||[]  ,remote.medLib||[]  ),
+        foodLib:  mergeInto(localState.foodLib||[] ,remote.foodLib||[] ),
         checkins: mergeInto(localState.checkins||[],
-                    (remote.checkins||[]).concat(q.filter(x=>x._type==='checkin')),byId)
-                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+                    (remote.checkins||[]).concat(q.filter(x=>x._type==='checkin'))
+                  ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
         version:1, lastModified:new Date().toISOString()
       };
 
-      await drive.writeFile(fid, merged);
+      await drive.writeFile(fid,merged);
       clearQueue(); setOfflineCount(0);
       setEvents(merged.events); setPending(merged.pending);
       setMeds(merged.meds); setFood(merged.food);
@@ -1593,27 +1543,19 @@ function App(){
       setLastSynced(new Date().toISOString());
       setSyncStatus('synced');
     }catch(e){
-      // Token probably expired — reset so next sync gets a fresh one
       driveRef.current=null; setDriveInstance(null);
-      setSyncStatus('error');
+      setSyncStatus('needs-reauth');
     }
     finally{ isSyncing.current=false; }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[getToken]);
+  },[]);
 
   // Keep syncToDriveRef current
   useEffect(()=>{ syncToDriveRef.current = syncWithDrive; },[syncWithDrive]);
 
   // ── Token handler: sign-in button ─────────────────────────
   const handleToken = useCallback(async (accessToken)=>{
-    try{
-      const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo',
-        {headers:{Authorization:`Bearer ${accessToken}`}});
-      const info = await r.json();
-      setUserInfo(info);
-      saveSession(info);
-    }catch(e){}
-    // Load from Drive on first sign-in
+    // Load from Drive first
     const drive = new DriveSync(accessToken);
     driveRef.current=drive; setToken(accessToken); setDriveInstance(drive);
     try{
@@ -1636,6 +1578,17 @@ function App(){
       setLastSynced(new Date().toISOString());
       setSyncStatus('synced');
     }catch(e){ setSyncStatus('offline'); }
+
+    // Fetch user info — but save a session regardless so the app works offline next open
+    let sessionInfo = {name:'User', email:'', picture:''};
+    try{
+      const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo',
+        {headers:{Authorization:`Bearer ${accessToken}`}});
+      if(r.ok) sessionInfo = await r.json();
+    }catch(e){}
+    setUserInfo(sessionInfo);
+    saveSession(sessionInfo);   // ← always saved, even if userinfo fetch fails
+
     setAuthStatus('ready');
   // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
@@ -1781,8 +1734,30 @@ function App(){
     window.location.reload();
   };
   const manualSync=()=>{
+    if(syncStatus==='needs-reauth'||!driveRef.current){
+      // Token expired — need user to sign in again to get a new one
+      // Show a minimal re-auth: just request a token with the existing clientId
+      if(!navigator.onLine){ showFlash('No connection — sync will resume when online',C.amber); return; }
+      if(!clientId||!window.google?.accounts?.oauth2){ showFlash('Cannot reconnect right now',C.amber); return; }
+      try{
+        window.google.accounts.oauth2.initTokenClient({
+          client_id:clientId,
+          scope:'https://www.googleapis.com/auth/drive.file openid email profile',
+          callback:(resp)=>{
+            if(resp?.access_token){
+              const drive=new DriveSync(resp.access_token);
+              driveRef.current=drive; setToken(resp.access_token); setDriveInstance(drive);
+              showFlash('Drive reconnected ✓');
+              setSyncStatus('stale');
+              syncWithDrive({events,pending,meds,food,medLib,foodLib,checkins});
+            }else{ showFlash('Could not reconnect — try again',C.red); }
+          }
+        }).requestAccessToken();
+      }catch(e){ showFlash('Could not reconnect — try again',C.red); }
+      return;
+    }
     syncWithDrive({events,pending,meds,food,medLib,foodLib,checkins})
-      .then(()=>showFlash("☁️ Synced ✓"));
+      .then(()=>showFlash('☁️ Synced ✓'));
   };
 
   // ── Computed ──────────────────────────────────────────────
@@ -1813,8 +1788,8 @@ function App(){
   if(authStatus==='needs-login')return <AuthScreen clientId={clientId} onToken={handleToken}/>;
 
   // ── Sync status label ─────────────────────────────────────
-  const syncLabel=syncStatus==='saving'?'Saving…':syncStatus==='offline'&&offlineCount>0?`${offlineCount} queued`:syncStatus==='offline'?'Offline':syncStatus==='stale'?'Pending':syncStatus==='error'?'Sync error':'☁️ Drive';
-  const syncColor=syncStatus==='error'?C.red:syncStatus==='offline'?C.amber:syncStatus==='synced'?C.green:C.sub;
+  const syncLabel=syncStatus==='saving'?'Saving…':syncStatus==='needs-reauth'?'Tap to reconnect':syncStatus==='offline'&&offlineCount>0?`${offlineCount} queued`:syncStatus==='offline'?'Offline':syncStatus==='stale'?'Pending':syncStatus==='error'?'Sync error':'☁️ Drive';
+  const syncColor=syncStatus==='needs-reauth'?C.amber:syncStatus==='error'?C.red:syncStatus==='offline'?C.amber:syncStatus==='synced'?C.green:C.sub;
 
   // ── HOME CONTENT ──────────────────────────────────────────
   const pad2=n=>String(n).padStart(2,'0');
