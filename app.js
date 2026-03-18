@@ -14,11 +14,23 @@ function clearQueue() { localStorage.removeItem(QUEUE_KEY); }
 // Full local data snapshot — persisted independently of the queue
 // so the app can load data even when Drive/auth is unavailable
 const LOCAL_DATA_KEY = 'fnd_local_snapshot';
+const SESSION_KEY    = 'fnd_session';          // persists user info across restarts
+
 function saveLocalSnapshot(data) {
   try { localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify({...data, _savedAt: new Date().toISOString()})); } catch(e) {}
 }
 function loadLocalSnapshot() {
   try { return JSON.parse(localStorage.getItem(LOCAL_DATA_KEY)||'null'); } catch { return null; }
+}
+function saveSession(info) {
+  try { localStorage.setItem(SESSION_KEY, JSON.stringify(info)); } catch(e) {}
+}
+function loadSession() {
+  try { return JSON.parse(localStorage.getItem(SESSION_KEY)||'null'); } catch { return null; }
+}
+function clearSession() {
+  localStorage.removeItem(SESSION_KEY);
+  localStorage.removeItem(LOCAL_DATA_KEY);
 }
 
 class DriveSync {
@@ -1419,11 +1431,12 @@ function App(){
 
   // ── Drive state ──────────────────────────────────────────
   const[clientId,setClientId]=useState(localStorage.getItem('fnd_google_client_id')||'');
-  const[token,setToken]=useState(null);
-  const[userInfo,setUserInfo]=useState(null);
+  const[token,setToken]=useState(null);           // Drive API token — null when offline/expired
+  const[userInfo,setUserInfo]=useState(loadSession); // load persisted session immediately
   const[fileId,setFileId]=useState(localStorage.getItem('fnd_file_id')||null);
   const[driveInstance,setDriveInstance]=useState(null);
-  const[authStatus,setAuthStatus]=useState('idle');
+  // authStatus: 'boot' → check local → 'ready' (offline) or go get token → 'ready' (online)
+  const[authStatus,setAuthStatus]=useState('boot');
   const[authError,setAuthError]=useState('');
   const[gsiReady,setGsiReady]=useState(!!window.google?.accounts?.oauth2);
   const[syncStatus,setSyncStatus]=useState('synced');
@@ -1432,14 +1445,15 @@ function App(){
   const isSyncing=useRef(false);
   const syncTimer=useRef(null);
 
-  // ── App data ─────────────────────────────────────────────
-  const[events,setEvents]=useState([]);
-  const[pending,setPending]=useState([]);
-  const[meds,setMeds]=useState([]);
-  const[food,setFood]=useState([]);
-  const[medLib,setMedLib]=useState([]);
-  const[foodLib,setFoodLib]=useState([]);
-  const[checkins,setCheckins]=useState([]);
+  // ── App data — pre-populate from local snapshot if available ─
+  const _snap = loadLocalSnapshot();
+  const[events,setEvents]=useState(()=>(_snap?.events||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+  const[pending,setPending]=useState(()=>(_snap?.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+  const[meds,setMeds]=useState(()=>(_snap?.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+  const[food,setFood]=useState(()=>(_snap?.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+  const[medLib,setMedLib]=useState(()=>_snap?.medLib||[]);
+  const[foodLib,setFoodLib]=useState(()=>_snap?.foodLib||[]);
+  const[checkins,setCheckins]=useState(()=>(_snap?.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
   const[tab,setTab]=useState("home");
   const[modal,setModal]=useState(null);
   const[revIdx,setRevIdx]=useState(0);
@@ -1448,40 +1462,165 @@ function App(){
 
   const showFlash=(msg,color=C.green)=>{setFlash({msg,color});setTimeout(()=>setFlash(null),2500);};
 
-  // ── GSI polling ──────────────────────────────────────────
+  // ── Boot sequence ─────────────────────────────────────────
+  // On every app open:
+  //  1. If we have a stored session + local snapshot → show app immediately (no login screen)
+  //  2. Attempt silent token refresh in background → if successful, sync Drive
+  //  3. If no session at all → show sign-in screen
   useEffect(()=>{
-    if(gsiReady)return;
+    const session=loadSession();
+    const snap=loadLocalSnapshot();
+    if(session&&snap){
+      // We have everything needed to show the app offline — go straight in
+      setUserInfo(session);
+      setAuthStatus('ready');
+      setSyncStatus(navigator.onLine?'stale':'offline');
+      document.getElementById('root-loader')?.remove();
+      // Now try to get a fresh token in the background (non-blocking)
+      tryRefreshToken();
+    } else if(session&&!snap){
+      // Have session but no local data — need to load from Drive
+      // Try token refresh; if offline, show empty app
+      setUserInfo(session);
+      if(navigator.onLine){
+        tryRefreshToken();
+      } else {
+        setAuthStatus('ready');
+        setSyncStatus('offline');
+        document.getElementById('root-loader')?.remove();
+      }
+    } else {
+      // No session — need to sign in
+      setAuthStatus('needs-login');
+      document.getElementById('root-loader')?.remove();
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
+
+  // ── GSI polling ──────────────────────────────────────────
+  // Once GSI loads, if we have a session, immediately try a silent token refresh
+  useEffect(()=>{
+    if(gsiReady){
+      // GSI just became available — fire the background token refresh now
+      const session=loadSession();
+      if(session) tryRefreshToken();
+      return;
+    }
     let attempts=0;
-    const t=setInterval(()=>{attempts++;if(window.google?.accounts?.oauth2){setGsiReady(true);clearInterval(t);}else if(attempts>30){clearInterval(t);setAuthError('Could not load Google sign-in. Check connection and reload.');setAuthStatus('error');}},500);
+    const t=setInterval(()=>{
+      attempts++;
+      if(window.google?.accounts?.oauth2){
+        setGsiReady(true);
+        clearInterval(t);
+      } else if(attempts>60){ clearInterval(t); } // give up after 30s silently
+    },500);
     return()=>clearInterval(t);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[gsiReady]);
 
-  // ── Proactive token refresh every 45 min ─────────────────
-  // Google tokens expire after 1 hour. Silently refresh before that
-  // so the user is never interrupted mid-session.
-  useEffect(()=>{
-    if(!clientId||authStatus!=='ready')return;
-    const refresh=()=>{
-      if(!window.google?.accounts?.oauth2||!navigator.onLine)return;
-      try{
-        const client=window.google.accounts.oauth2.initTokenClient({
-          client_id:clientId,
-          scope:'https://www.googleapis.com/auth/drive.file openid email profile',
-          prompt:'none',
-          callback:(resp)=>{
-            if(resp.access_token&&driveInstance){
-              // Update the drive instance token silently
-              driveInstance.token=resp.access_token;
+  // Try to get a fresh token silently — called on boot (after GSI loads) and periodically
+  function tryRefreshToken(){
+    if(!window.google?.accounts?.oauth2||!clientId)return;
+    if(!navigator.onLine)return;
+    try{
+      const client=window.google.accounts.oauth2.initTokenClient({
+        client_id:clientId,
+        scope:'https://www.googleapis.com/auth/drive.file openid email profile',
+        prompt:'none',
+        callback:(resp)=>{
+          if(resp.access_token){
+            const drive=new DriveSync(resp.access_token);
+            setToken(resp.access_token);
+            setDriveInstance(drive);
+            if(authStatus!=='ready'||!loadLocalSnapshot()){
+              loadFromDrive(resp.access_token,drive);
+            } else {
+              // Already showing app — sync in background
+              setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+                if(syncToDriveRef.current) syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+                return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
             }
-          },
-          error_callback:()=>{}  // silent fail — will retry next interval
-        });
-        client.requestAccessToken();
-      }catch(e){}
+          }
+          // Silent fail — app already loaded from snapshot, will retry later
+        },
+        error_callback:()=>{}
+      });
+      client.requestAccessToken();
+    }catch(e){}
+  }
+
+  // Keep syncToDriveRef always pointing at the latest syncToDrive
+  const syncToDriveRef=useRef(null);
+  useEffect(()=>{syncToDriveRef.current=syncToDrive;},[syncToDrive]);
+
+  // ── Proactive token refresh ───────────────────────────────
+  // Refresh every 50 minutes while app is open (tokens last 60 min)
+  // Also refresh whenever the app comes back to the foreground
+  useEffect(()=>{
+    if(authStatus!=='ready')return;
+    const interval=setInterval(tryRefreshToken,50*60*1000);
+    // Also try immediately when user switches back to the app
+    const onVisible=()=>{
+      if(document.visibilityState==='visible'&&navigator.onLine) tryRefreshToken();
     };
-    const t=setInterval(refresh,45*60*1000); // every 45 minutes
-    return()=>clearInterval(t);
-  },[clientId,authStatus,driveInstance]);
+    document.addEventListener('visibilitychange',onVisible);
+    return()=>{clearInterval(interval);document.removeEventListener('visibilitychange',onVisible);};
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[authStatus,clientId]);
+
+  // Load data fresh from Drive after getting a token
+  async function loadFromDrive(accessToken,drive){
+    setAuthStatus('loading-drive');
+    try{
+      let fid=fileId;let data;
+      if(fid){try{data=await drive.readFile(fid);}catch(e){localStorage.removeItem('fnd_file_id');fid=null;}}
+      if(!fid){const result=await drive.init();fid=result.fileId;data=result.data;localStorage.setItem('fnd_file_id',fid);setFileId(fid);if(result.isNew)showFlash("New data file created in Drive 🎉");}
+      const q=loadQueue();
+      const qEvts=q.filter(x=>!x._type);
+      const byId=x=>x.id;
+      const mergedEvents=mergeByKey((data.events||[]),qEvts,byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      setEvents(mergedEvents);
+      setPending((data.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      setMeds((data.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      setFood((data.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      setMedLib(data.medLib||[]);setFoodLib(data.foodLib||[]);
+      setCheckins((data.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      if(qEvts.length){
+        const merged={...data,events:mergeByKey((data.events||[]),qEvts,byId)};
+        drive.writeFile(fid,merged).then(()=>clearQueue()).catch(()=>{});
+      }
+      const snap={events:mergedEvents,pending:data.pending||[],meds:data.meds||[],food:data.food||[],medLib:data.medLib||[],foodLib:data.foodLib||[],checkins:data.checkins||[]};
+      saveLocalSnapshot(snap);
+      setLastSynced(new Date().toISOString());
+      setAuthStatus('ready');
+      setSyncStatus('synced');
+      document.getElementById('root-loader')?.remove();
+    }catch(e){
+      // Drive failed — fall through to local snapshot or empty app
+      const snap=loadLocalSnapshot();
+      if(snap){
+        setEvents(snap.events||[]);setPending(snap.pending||[]);setMeds(snap.meds||[]);
+        setFood(snap.food||[]);setMedLib(snap.medLib||[]);setFoodLib(snap.foodLib||[]);
+        setCheckins(snap.checkins||[]);
+      }
+      setAuthStatus('ready');setSyncStatus('offline');
+      document.getElementById('root-loader')?.remove();
+    }
+  }
+
+  // ── Token handler (called from AuthScreen sign-in button) ─
+  async function handleToken(accessToken){
+    const drive=new DriveSync(accessToken);
+    setToken(accessToken);setDriveInstance(drive);
+    // Fetch user info and persist session
+    try{
+      const r=await fetch('https://www.googleapis.com/oauth2/v3/userinfo',{headers:{Authorization:`Bearer ${accessToken}`}});
+      const info=await r.json();
+      setUserInfo(info);
+      saveSession(info);
+    }catch(e){}
+    await loadFromDrive(accessToken,drive);
+  }
 
   // ── Core sync: write local state → merge in any NEW remote entries ──
   // Local state is authoritative. Deletions and edits made locally are
@@ -1571,7 +1710,7 @@ function App(){
     },4000);
   },[syncToDrive]);
 
-  // Online/offline + visibility
+  // Online/offline sync trigger
   useEffect(()=>{
     const triggerSync=()=>{
       setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
@@ -1580,9 +1719,9 @@ function App(){
     };
     const onOnline=()=>{setSyncStatus('stale');triggerSync();};
     const onOffline=()=>setSyncStatus('offline');
-    const onVisible=()=>{if(document.visibilityState==='visible'&&navigator.onLine)triggerSync();};
-    window.addEventListener('online',onOnline);window.addEventListener('offline',onOffline);document.addEventListener('visibilitychange',onVisible);
-    return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);document.removeEventListener('visibilitychange',onVisible);};
+    window.addEventListener('online',onOnline);
+    window.addEventListener('offline',onOffline);
+    return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);};
   },[syncToDrive]);
 
   // ── Token handler ─────────────────────────────────────────
@@ -1717,10 +1856,10 @@ function App(){
   };
   const signOut=()=>{
     if(!window.confirm("Sign out?"))return;
-    // Revoke Google's stored consent so silent re-auth doesn't bypass the sign-out
     if(window.google?.accounts?.oauth2&&token){
       window.google.accounts.oauth2.revoke(token,()=>{});
     }
+    clearSession();
     localStorage.removeItem('fnd_file_id');
     window.location.reload();
   };
@@ -1744,28 +1883,22 @@ function App(){
   const reviewing=modal==="review"&&pending[revIdx];
 
   // ── Render gate ───────────────────────────────────────────
+  // Rule: the ONLY thing that shows the sign-in screen is having no stored session.
+  // A missing token, expired token, or no network connection must never block the app.
   if(!clientId)return <ClientIdSetup onSave={setClientId}/>;
-  if(authStatus==='error')return(
-    <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",minHeight:"100vh",background:C.bg,color:C.text,padding:24,textAlign:"center"}}>
-      <div style={{fontSize:40,marginBottom:12}}>⚠️</div>
-      <h2 style={{marginBottom:8}}>Something went wrong</h2>
-      <p style={{color:C.muted,fontSize:14,marginBottom:20,maxWidth:280,lineHeight:1.6}}>{authError}</p>
-      <Btn onClick={()=>{setToken(null);setAuthStatus('idle');setGsiReady(!!window.google?.accounts?.oauth2);}}>← Try again</Btn>
-    </div>
-  );
-  if(!gsiReady)return(
+  if(authStatus==='boot')return(
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",color:C.green,gap:12,background:C.bg}}>
       <div style={{fontSize:"2rem"}}>⚡</div>
       <div style={{fontWeight:700}}>FND Tracker</div>
-      <div style={{color:C.muted,fontSize:13}}>Loading Google sign-in…</div>
+      <div style={{color:C.muted,fontSize:13}}>Loading…</div>
     </div>
   );
-  if(!token)return <AuthScreen clientId={clientId} onToken={handleToken}/>;
-  if(authStatus==='loading')return(
+  if(authStatus==='needs-login')return <AuthScreen clientId={clientId} onToken={handleToken}/>;
+  if(authStatus==='loading-drive')return(
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",color:C.green,gap:12,background:C.bg}}>
       <div style={{fontSize:"2rem"}}>⚡</div>
       <div style={{fontWeight:700}}>FND Tracker</div>
-      <div style={{color:C.muted,fontSize:13}}>Loading Drive data…</div>
+      <div style={{color:C.muted,fontSize:13}}>Syncing with Drive…</div>
     </div>
   );
 
