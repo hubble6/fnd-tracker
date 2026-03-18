@@ -32,10 +32,10 @@
 <script>
   setTimeout(function(){
     var l=document.getElementById('root-loader');
-    if(!l)return;
+    if(!l||l.style.display==='none')return;
     var m=document.getElementById('loader-msg');var b=document.getElementById('reload-btn');
     if(m)m.textContent='Taking longer than expected…';if(b)b.style.display='block';
-  },12000);
+  },5000);
 </script>
 <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
 <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
