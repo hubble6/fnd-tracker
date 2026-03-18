@@ -855,15 +855,105 @@ function buildReport(events,meds,food){
 }
 
 /* ═══════════════════════════════════════════════════════════
-   EXPORT TAB
+   EXPORT TAB (includes Import)
    ═══════════════════════════════════════════════════════════ */
-function ExportTab({events,meds,food,onReset,userInfo,onSignOut}){
+function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut}){
   const[confirmReset,setConfirmReset]=useState(false);
+  const[importState,setImportState]=useState(null);
+  const[importError,setImportError]=useState(null);
+  const[showFormat,setShowFormat]=useState(false);
+  const[openSection,setOpenSection]=useState(null);
+  const fileRef=useRef(null);
+  const toggle=s=>setOpenSection(o=>o===s?null:s);
+
+  // ── CSV parsing ──────────────────────────────────────────
+  const parseCSV=(text)=>{
+    const lines=text.trim().split(/\r?\n/);
+    if(lines.length<2)return[];
+    const headers=lines[0].split(',').map(h=>h.trim().toLowerCase().replace(/[^a-z0-9_]/g,''));
+    return lines.slice(1).map(line=>{
+      const cols=[];let cur='';let inQ=false;
+      for(let i=0;i<line.length;i++){
+        if(line[i]==='"'){inQ=!inQ;}
+        else if(line[i]===','&&!inQ){cols.push(cur.trim());cur='';}
+        else cur+=line[i];
+      }
+      cols.push(cur.trim());
+      const obj={};headers.forEach((h,i)=>{obj[h]=cols[i]||'';});
+      return obj;
+    }).filter(r=>Object.values(r).some(v=>v));
+  };
+  const rowToEvent=(row)=>{
+    let ts=null;
+    if(row.timestamp)ts=new Date(row.timestamp);
+    else if(row.date){const ds=row.date.trim(),ti=(row.time||'00:00').trim();ts=new Date(`${ds}T${ti}`);if(isNaN(ts))ts=new Date(ds);}
+    if(!ts||isNaN(ts))return null;
+    return{id:uid(),timestamp:ts.toISOString(),notes:row.notes||row.note||''};
+  };
+  const rowToMed=(row)=>{const b=rowToEvent(row);if(!b)return null;const name=row.name||row.medication||row.med||'';if(!name)return null;return{...b,name,detail:row.detail||row.dose||'',notes:row.notes||row.note||''};};
+  const rowToFood=(row)=>{const b=rowToEvent(row);if(!b)return null;const name=row.name||row.food||row.item||'';if(!name)return null;return{...b,name,detail:row.detail||'',category:row.category||''};};
+
+  const handleFileSelect=(e)=>{
+    const file=e.target.files[0];if(!file)return;
+    setImportError(null);
+    const reader=new FileReader();
+    reader.onload=(ev)=>{
+      try{
+        const text=ev.target.result;
+        const rows=parseCSV(text);
+        if(!rows.length){setImportError("No data rows found. Check the file has a header row and at least one data row.");return;}
+        const headers=Object.keys(rows[0]);
+        const fname=file.name.toLowerCase();
+        let type='events';
+        if(fname.includes('med'))type='meds';
+        else if(fname.includes('food')||fname.includes('meal'))type='food';
+        else if(headers.some(h=>['name','medication','med'].includes(h))&&!headers.some(h=>['food','item','category'].includes(h)))type='meds';
+        else if(headers.some(h=>['food','item','category'].includes(h)))type='food';
+        let evts=[],meds_=[],food_=[];
+        if(type==='meds')meds_=rows.map(rowToMed).filter(Boolean);
+        else if(type==='food')food_=rows.map(rowToFood).filter(Boolean);
+        else evts=rows.map(rowToEvent).filter(Boolean);
+        const total=evts.length+meds_.length+food_.length;
+        if(!total){setImportError("Rows found but could not be parsed. See the format guide.");return;}
+        setImportState({data:{events:evts,meds:meds_,food:food_},filename:file.name,type});
+      }catch(err){setImportError("Could not read file: "+err.message);}
+    };
+    reader.readAsText(file);e.target.value="";
+  };
+
+  const confirmImport=()=>{
+    if(!importState)return;
+    const hasData=events.length>0||meds.length>0||food.length>0;
+    onImport(importState.data,hasData?"merge":"replace");
+    setImportState(null);setImportError(null);
+  };
+
+  const AccordionHeader=({id,icon,title,desc,color="#93c5fd"})=>{
+    const open=openSection===id;
+    return(
+      <button onClick={()=>toggle(id)} style={{width:"100%",display:"flex",alignItems:"center",gap:12,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
+        <div style={{width:36,height:36,borderRadius:10,background:open?color+"22":"#1e293b",display:"flex",alignItems:"center",justifyContent:"center",fontSize:18,flexShrink:0,border:`1px solid ${open?color:C.border}`}}>{icon}</div>
+        <div style={{flex:1}}>
+          <div style={{color:open?color:C.text,fontWeight:700,fontSize:14}}>{title}</div>
+          <div style={{color:C.muted,fontSize:11,marginTop:1}}>{desc}</div>
+        </div>
+        <div style={{color:C.muted,fontSize:14,fontWeight:700}}>{open?"▲":"▼"}</div>
+      </button>
+    );
+  };
+
+  const allTs=[...events,...meds,...food].map(e=>new Date(e.timestamp)).filter(d=>!isNaN(d));
+  const earliest=allTs.length?new Date(Math.min(...allTs)):null;
+  const latest=allTs.length?new Date(Math.max(...allTs)):null;
+  const spanDays=earliest&&latest?Math.round((latest-earliest)/864e5)+1:0;
+
   return(
     <div style={{display:"flex",flexDirection:"column",gap:12}}>
+
+      {/* Dataset overview */}
       <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
         <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.07em",marginBottom:12}}>Dataset Overview</div>
-        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:12}}>
+        <div style={{display:"grid",gridTemplateColumns:"repeat(3,1fr)",gap:8,marginBottom:spanDays>0?12:0}}>
           {[{icon:"⚡",label:"Events",value:events.length,color:C.green},{icon:"💊",label:"Medications",value:meds.length,color:C.purple},{icon:"🍽",label:"Meals",value:food.length,color:C.teal}].map(({icon,label,value,color})=>(
             <div key={label} style={{background:"#0a0f1a",border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 12px",textAlign:"center"}}>
               <div style={{fontSize:18,marginBottom:4}}>{icon}</div>
@@ -872,15 +962,122 @@ function ExportTab({events,meds,food,onReset,userInfo,onSignOut}){
             </div>
           ))}
         </div>
+        {spanDays>0&&<div style={{color:C.muted,fontSize:11,textAlign:"center"}}>{fmtDate(earliest.toISOString())} – {fmtDate(latest.toISOString())} · {spanDays} days of data</div>}
       </div>
-      <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
-        <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.07em",marginBottom:12}}>Export</div>
-        <div style={{display:"flex",flexDirection:"column",gap:8}}>
-          <Btn onClick={()=>{const rows=[...events.map(e=>({type:'event',timestamp:e.timestamp,date:fmtDate(e.timestamp),time:fmtTime(e.timestamp),name:'',detail:'',notes:e.notes||''})),...meds.map(m=>({type:'med',timestamp:m.timestamp,date:fmtDate(m.timestamp),time:fmtTime(m.timestamp),name:m.name||'',detail:m.detail||'',notes:m.notes||''})),...food.map(f=>({type:'food',timestamp:f.timestamp,date:fmtDate(f.timestamp),time:fmtTime(f.timestamp),name:f.name||'',detail:f.detail||'',notes:f.notes||''}))].sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));downloadFile(toCSV(rows,['type','timestamp','date','time','name','detail','notes']),`fnd-export-${Date.now()}.csv`,'text/csv');}} fullWidth>📊 Export All as CSV</Btn>
-          <Btn onClick={()=>{const rows=events.map(e=>({timestamp:e.timestamp,date:fmtDate(e.timestamp),time:fmtTime(e.timestamp),notes:e.notes||''}));downloadFile(toCSV(rows,['timestamp','date','time','notes']),`fnd-events-${Date.now()}.csv`,'text/csv');}} variant="secondary" fullWidth>⚡ Events CSV</Btn>
-          <Btn onClick={()=>{const{text,dateStr}=buildReport(events,meds,food);downloadFile(text,`fnd-physician-report-${dateStr}.txt`,'text/plain');}} variant="secondary" fullWidth>📄 Physician Report (.txt)</Btn>
-        </div>
+
+      {/* Export accordion */}
+      <div style={{background:C.card,border:`1px solid ${openSection==="export"?C.green:C.border}`,borderRadius:12,padding:16}}>
+        <AccordionHeader id="export" icon="📤" title="Export" desc="Download your data as CSV or a physician report" color={C.green}/>
+        {openSection==="export"&&(
+          <div style={{marginTop:14,display:"flex",flexDirection:"column",gap:10}}>
+            <div style={{background:"#0a0f1a",border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px"}}>
+              <div style={{color:C.sub,fontSize:12,fontWeight:700,marginBottom:6}}>📋 Physician Report</div>
+              <div style={{color:C.muted,fontSize:11,marginBottom:10}}>Readable summary with time-of-day analysis — ideal for your medical team.</div>
+              <Btn onClick={()=>{const{text,dateStr}=buildReport(events,meds,food);downloadFile(text,`fnd-physician-report-${dateStr}.txt`,'text/plain');}} fullWidth small>⬇ Download Report (.txt)</Btn>
+            </div>
+            <div style={{background:"#0a0f1a",border:`1px solid ${C.border}`,borderRadius:10,padding:"12px 14px"}}>
+              <div style={{color:C.sub,fontSize:12,fontWeight:700,marginBottom:6}}>📑 CSV Export</div>
+              <div style={{color:C.muted,fontSize:11,marginBottom:10}}>Raw data — opens in Excel or Google Sheets, or re-import here.</div>
+              <div style={{display:"flex",flexDirection:"column",gap:6}}>
+                <Btn onClick={()=>{const rows=[...events.map(e=>({type:'event',timestamp:e.timestamp,date:fmtDate(e.timestamp),time:fmtTime(e.timestamp),name:'',detail:'',notes:e.notes||''})),...meds.map(m=>({type:'med',timestamp:m.timestamp,date:fmtDate(m.timestamp),time:fmtTime(m.timestamp),name:m.name||'',detail:m.detail||'',notes:m.notes||''})),...food.map(f=>({type:'food',timestamp:f.timestamp,date:fmtDate(f.timestamp),time:fmtTime(f.timestamp),name:f.name||'',detail:f.detail||'',notes:f.notes||''}))].sort((a,b)=>new Date(a.timestamp)-new Date(b.timestamp));downloadFile(toCSV(rows,['type','timestamp','date','time','name','detail','notes']),`fnd-export-${Date.now()}.csv`,'text/csv');}} fullWidth small>⬇ All data (.csv)</Btn>
+                <div style={{display:"grid",gridTemplateColumns:"1fr 1fr 1fr",gap:6}}>
+                  <Btn onClick={()=>{const rows=events.map(e=>({timestamp:e.timestamp,date:fmtDate(e.timestamp),time:fmtTime(e.timestamp),notes:e.notes||''}));downloadFile(toCSV(rows,['timestamp','date','time','notes']),`fnd-events-${Date.now()}.csv`,'text/csv');}} variant="secondary" fullWidth small>⬇ Events</Btn>
+                  <Btn onClick={()=>{const rows=meds.map(m=>({timestamp:m.timestamp,date:fmtDate(m.timestamp),time:fmtTime(m.timestamp),name:m.name,detail:m.detail||'',notes:m.notes||''}));downloadFile(toCSV(rows,['timestamp','date','time','name','detail','notes']),`fnd-meds-${Date.now()}.csv`,'text/csv');}} variant="secondary" fullWidth small>⬇ Meds</Btn>
+                  <Btn onClick={()=>{const rows=food.map(f=>({timestamp:f.timestamp,date:fmtDate(f.timestamp),time:fmtTime(f.timestamp),name:f.name,detail:f.detail||'',notes:f.notes||''}));downloadFile(toCSV(rows,['timestamp','date','time','name','detail','notes']),`fnd-food-${Date.now()}.csv`,'text/csv');}} variant="secondary" fullWidth small>⬇ Food</Btn>
+                </div>
+              </div>
+            </div>
+          </div>
+        )}
       </div>
+
+      {/* Import accordion */}
+      <div style={{background:C.card,border:`1px solid ${openSection==="import"?"#93c5fd":C.border}`,borderRadius:12,padding:16}}>
+        <AccordionHeader id="import" icon="📥" title="Import" desc="Load events, medications or meals from a CSV file" color="#93c5fd"/>
+        {openSection==="import"&&(
+          <div style={{marginTop:14}}>
+            {/* Format guide */}
+            <button onClick={()=>setShowFormat(f=>!f)} style={{width:"100%",textAlign:"left",background:"#0a1628",border:`1px solid ${showFormat?"#3b82f6":C.border}`,borderRadius:8,padding:"8px 12px",cursor:"pointer",marginBottom:10,display:"flex",justifyContent:"space-between",alignItems:"center"}}>
+              <span style={{color:"#93c5fd",fontSize:12,fontWeight:700}}>ℹ️ CSV format guide</span>
+              <span style={{color:C.muted,fontSize:11}}>{showFormat?"▲ hide":"▼ show"}</span>
+            </button>
+            {showFormat&&(
+              <div style={{background:"#060d1a",border:"1px solid #1e3a5f",borderRadius:8,padding:12,marginBottom:10,fontSize:11,lineHeight:1.8}}>
+                <div style={{color:"#93c5fd",fontWeight:700,marginBottom:6}}>File type is detected from filename:</div>
+                <div style={{color:C.muted,marginBottom:10}}>
+                  <span style={{color:C.text}}>"med"</span> → Medications · <span style={{color:C.text}}>"food"/"meal"</span> → Meals · Everything else → Events
+                </div>
+                {[
+                  {title:"⚡ Events",sample:"date,time,notes\n2025-03-01,14:32,woke up with headache"},
+                  {title:"💊 Medications",sample:"date,time,name,detail,notes\n2025-03-01,08:00,Keppra,500mg,with food"},
+                  {title:"🍽 Meals",sample:"date,time,name,category,notes\n2025-03-01,12:30,Pasta,gluten,"},
+                ].map(({title,sample})=>(
+                  <div key={title} style={{marginBottom:10}}>
+                    <div style={{color:"#93c5fd",fontWeight:700,marginBottom:4}}>{title}</div>
+                    <div style={{background:"#0f172a",borderRadius:6,padding:"6px 8px",fontFamily:"monospace",color:C.green,fontSize:10,overflowX:"auto",whiteSpace:"pre"}}>{sample}</div>
+                  </div>
+                ))}
+              </div>
+            )}
+            {/* File picker / merge preview */}
+            {!importState?(
+              <div>
+                {importError&&<div style={{color:"#f87171",fontSize:12,marginBottom:10,padding:"8px 12px",background:"#450a0a",borderRadius:8}}>{importError}</div>}
+                <input ref={fileRef} type="file" accept=".csv,text/csv" onChange={handleFileSelect} style={{display:"none"}}/>
+                <Btn onClick={()=>fileRef.current.click()} fullWidth>📂 Choose CSV File</Btn>
+              </div>
+            ):(()=>{
+              const hasData=events.length>0||meds.length>0||food.length>0;
+              const d=importState.data;
+              const incoming=d.events.length+d.meds.length+d.food.length;
+              const evtKey=e=>new Date(e.timestamp).toISOString().slice(0,16);
+              const itemKey=e=>`${new Date(e.timestamp).toISOString().slice(0,16)}|${(e.name||"").toLowerCase().trim()}`;
+              const newEvts=d.events.filter(e=>!new Set(events.map(evtKey)).has(evtKey(e))).length;
+              const newMeds=d.meds.filter(e=>!new Set(meds.map(itemKey)).has(itemKey(e))).length;
+              const newFood=d.food.filter(e=>!new Set(food.map(itemKey)).has(itemKey(e))).length;
+              const newTotal=newEvts+newMeds+newFood;
+              const dupes=incoming-newTotal;
+              return(
+                <div>
+                  <div style={{background:C.surface,border:`1px solid ${C.border}`,borderRadius:10,padding:"10px 14px",marginBottom:12}}>
+                    <div style={{color:C.text,fontWeight:700,fontSize:13,marginBottom:4}}>📄 {importState.filename}</div>
+                    <div style={{color:C.muted,fontSize:12,marginBottom:4}}>Detected: <span style={{color:C.amber,fontWeight:700}}>{importState.type==="meds"?"Medications":importState.type==="food"?"Meals":"FND Events"}</span></div>
+                    <div style={{display:"flex",gap:12,flexWrap:"wrap"}}>
+                      {d.events.length>0&&<span style={{color:C.muted,fontSize:12}}>⚡ {d.events.length} events</span>}
+                      {d.meds.length>0&&<span style={{color:C.muted,fontSize:12}}>💊 {d.meds.length} meds</span>}
+                      {d.food.length>0&&<span style={{color:C.muted,fontSize:12}}>🍽 {d.food.length} meals</span>}
+                    </div>
+                  </div>
+                  <div style={{background:hasData?"#0a1628":"#0c1a10",border:`1px solid ${hasData?"#1e3a5f":"#1a3a20"}`,borderRadius:10,padding:"12px 14px",marginBottom:12}}>
+                    {hasData?(
+                      <>
+                        <div style={{color:"#93c5fd",fontWeight:700,fontSize:13,marginBottom:6}}>🔀 Merge preview</div>
+                        <div style={{display:"flex",flexDirection:"column",gap:4}}>
+                          <div style={{display:"flex",justifyContent:"space-between",fontSize:12}}><span style={{color:C.muted}}>New records</span><span style={{color:C.green,fontWeight:700}}>{newTotal}</span></div>
+                          {dupes>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:12}}><span style={{color:C.muted}}>Already present (skipped)</span><span style={{color:"#4b5563",fontWeight:700}}>{dupes}</span></div>}
+                          {newEvts>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:11}}><span style={{color:"#374151"}}>⚡ Events</span><span style={{color:C.sub}}>+{newEvts}</span></div>}
+                          {newMeds>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:11}}><span style={{color:"#374151"}}>💊 Meds</span><span style={{color:C.sub}}>+{newMeds}</span></div>}
+                          {newFood>0&&<div style={{display:"flex",justifyContent:"space-between",fontSize:11}}><span style={{color:"#374151"}}>🍽 Meals</span><span style={{color:C.sub}}>+{newFood}</span></div>}
+                          {newTotal===0&&<div style={{color:C.amber,fontSize:12,marginTop:4}}>⚠ All records already exist — nothing new to add.</div>}
+                        </div>
+                      </>
+                    ):(
+                      <div style={{color:C.green,fontWeight:700,fontSize:13}}>✅ Ready — {incoming} record{incoming!==1?"s":""} will be loaded</div>
+                    )}
+                  </div>
+                  <div style={{display:"flex",gap:8}}>
+                    <Btn onClick={()=>{setImportState(null);setImportError(null);}} variant="secondary" fullWidth>Cancel</Btn>
+                    <Btn onClick={confirmImport} fullWidth style={{opacity:!hasData||newTotal>0?1:0.4,pointerEvents:!hasData||newTotal>0?"auto":"none"}}>
+                      {hasData?`🔀 Merge${newTotal>0?` (+${newTotal})`:""}`:"✅ Import"}
+                    </Btn>
+                  </div>
+                </div>
+              );
+            })()}
+          </div>
+        )}
+      </div>
+
       {/* Account */}
       <div style={{background:C.card,border:`1px solid ${C.border}`,borderRadius:12,padding:16}}>
         <div style={{color:C.muted,fontSize:10,textTransform:"uppercase",fontWeight:700,letterSpacing:"0.07em",marginBottom:12}}>Account</div>
@@ -890,6 +1087,7 @@ function ExportTab({events,meds,food,onReset,userInfo,onSignOut}){
         </div>
         <Btn onClick={onSignOut} variant="secondary" fullWidth>Sign Out</Btn>
       </div>
+
       {/* Reset */}
       <div style={{background:"#0d0505",border:`1px solid ${confirmReset?"#dc2626":"#3f1a1a"}`,borderRadius:12,padding:16}}>
         <button onClick={()=>setConfirmReset(v=>!v)} style={{width:"100%",display:"flex",alignItems:"center",gap:12,background:"none",border:"none",cursor:"pointer",textAlign:"left",padding:0}}>
@@ -1129,6 +1327,25 @@ function App(){
   const handleReviewSkip=()=>{const n=[...pending.slice(0,revIdx),...pending.slice(revIdx+1),pending[revIdx]];setPending(n);if(revIdx>=n.length)setRevIdx(0);if(n.length===1){setModal(null);showFlash("Saved for later",C.amber);}};
   const approveAll=()=>{const approved=pending.map(e=>({...e,pending:false}));const ne=[...approved,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(ne);setPending([]);scheduleSync();showFlash(`✅ Approved ${approved.length} event${approved.length!==1?"s":""}!`);};
   const resetApp=()=>{setEvents([]);setPending([]);setMeds([]);setFood([]);setMedLib([]);setFoodLib([]);setCheckins([]);scheduleSync();showFlash("🗑 All data cleared",C.amber);};
+  const handleImport=(imported,mode)=>{
+    const evtKey=e=>new Date(e.timestamp).toISOString().slice(0,16);
+    const itemKey=e=>`${new Date(e.timestamp).toISOString().slice(0,16)}|${(e.name||"").toLowerCase().trim()}`;
+    const dedup=(existing,incoming,keyFn)=>{const keys=new Set(existing.map(keyFn));return[...existing,...incoming.filter(e=>!keys.has(keyFn(e)))];};
+    if(mode==="replace"){
+      const ne=imported.events||[];const nm=imported.meds||[];const nf=imported.food||[];
+      setEvents(ne.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      setMeds(nm.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      setFood(nf.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      scheduleSync();showFlash(`✅ Replaced with ${ne.length} events, ${nm.length} meds, ${nf.length} meals`);
+    }else{
+      const ne=dedup(events,imported.events||[],evtKey).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      const nm=dedup(meds,imported.meds||[],itemKey).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      const nf=dedup(food,imported.food||[],itemKey).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      setEvents(ne);setMeds(nm);setFood(nf);
+      const added=(ne.length-events.length)+(nm.length-meds.length)+(nf.length-food.length);
+      scheduleSync();showFlash(`✅ Merged — ${added} new record${added!==1?"s":""} added`);
+    }
+  };
   const signOut=()=>{if(!window.confirm("Sign out?"))return;localStorage.removeItem('fnd_token');localStorage.removeItem('fnd_file_id');window.location.reload();};
   const manualSync=()=>{setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci}).then(()=>showFlash("☁️ Synced ✓"));return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});};
 
@@ -1256,13 +1473,13 @@ function App(){
     </div>
   );
 
-  const tabs=[{id:"home",label:"Home",icon:"🏠"},{id:"trends",label:"Trends",icon:"📊"},{id:"log",label:"History",icon:"📋"},{id:"export",label:"Export",icon:"📤"}];
+  const tabs=[{id:"home",label:"Home",icon:"🏠"},{id:"trends",label:"Trends",icon:"📊"},{id:"log",label:"History",icon:"📋"},{id:"export",label:"Import/Export",icon:"📤"}];
   const tabContent=(
     <>
       {tab==="home"&&homeContent}
       {tab==="trends"&&<TrendsTab events={events} food={food}/>}
       {tab==="log"&&<LogTab events={events} pending={pending} meds={meds} food={food} delEvent={delEvent} delPending={delPending} delMed={delMed} delFood={delFood} setEditing={setEditing} approveAll={approveAll}/>}
-      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} userInfo={userInfo} onSignOut={signOut}/>}
+      {tab==="export"&&<ExportTab events={events} meds={meds} food={food} onReset={resetApp} onImport={handleImport} userInfo={userInfo} onSignOut={signOut}/>}
     </>
   );
 
