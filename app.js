@@ -1410,8 +1410,6 @@ function App(){
   const[driveInstance,setDriveInstance]=useState(null);
   // authStatus: 'boot' → check local → 'ready' (offline) or go get token → 'ready' (online)
   const[authStatus,setAuthStatus]=useState('boot');
-  const[authError,setAuthError]=useState('');
-  const[gsiReady,setGsiReady]=useState(!!window.google?.accounts?.oauth2);
   const[syncStatus,setSyncStatus]=useState('synced');
   const[lastSynced,setLastSynced]=useState(null);
   const[offlineCount,setOfflineCount]=useState(loadQueue().length);
@@ -1435,343 +1433,263 @@ function App(){
 
   const showFlash=(msg,color=C.green)=>{setFlash({msg,color});setTimeout(()=>setFlash(null),2500);};
 
-  // ── Refs for stable async access (never stale) ─────────────
-  const authStatusRef = useRef('boot');
-  const fileIdRef     = useRef(localStorage.getItem('fnd_file_id')||null);
-  const clientIdRef   = useRef(localStorage.getItem('fnd_google_client_id')||'');
-  const syncToDriveRef= useRef(null);
-  useEffect(()=>{ authStatusRef.current = authStatus; }, [authStatus]);
-  useEffect(()=>{ fileIdRef.current = fileId; },         [fileId]);
-  useEffect(()=>{ syncToDriveRef.current = syncToDrive; },[syncToDrive]);
+  // ═══════════════════════════════════════════════════════════
+  // AUTH — SIMPLE SESSION MODEL
+  // ═══════════════════════════════════════════════════════════
+  // "Logged in" means: fnd_session exists in localStorage.
+  // That's it. No token, no network, no Google needed to open the app.
+  //
+  // Drive token is acquired LAZILY — only when a sync is actually
+  // attempted and we're online. It is never requested at boot.
+  // ═══════════════════════════════════════════════════════════
 
-  // ── loadFromDrive: fetch Drive data and populate app state ──
-  // Uses only refs — never reads React state directly, so safe to call
-  // from any async callback regardless of render cycle.
-  const loadFromDrive = useCallback(async (accessToken) => {
-    const drive = new DriveSync(accessToken);
-    setToken(accessToken);
-    setDriveInstance(drive);
-    setAuthStatus('loading-drive');
-    authStatusRef.current = 'loading-drive';
-    try {
-      let fid = fileIdRef.current;
-      let data;
-      if (fid) {
-        try { data = await drive.readFile(fid); }
-        catch(e) { localStorage.removeItem('fnd_file_id'); fileIdRef.current = null; fid = null; }
+  const fileIdRef      = useRef(localStorage.getItem('fnd_file_id')||null);
+  const driveRef       = useRef(null);   // current DriveSync instance
+  const syncToDriveRef = useRef(null);   // set after syncToDrive is defined
+  useEffect(()=>{ fileIdRef.current = fileId; }, [fileId]);
+
+  // ── Boot: purely from localStorage, zero network ──────────
+  useEffect(()=>{
+    const session = loadSession();
+    const snap    = loadLocalSnapshot();
+    if(session){
+      setUserInfo(session);
+      if(snap){
+        // Populate state from snapshot
+        setEvents((snap.events||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+        setPending((snap.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+        setMeds((snap.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+        setFood((snap.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+        setMedLib(snap.medLib||[]);
+        setFoodLib(snap.foodLib||[]);
+        setCheckins((snap.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       }
-      if (!fid) {
-        const result = await drive.init();
-        fid = result.fileId;
-        data = result.data;
-        localStorage.setItem('fnd_file_id', fid);
-        setFileId(fid);
-        fileIdRef.current = fid;
-        if (result.isNew) showFlash('New data file created in Drive 🎉');
-      }
-      const q = loadQueue();
-      const qEvts = q.filter(x => !x._type);
-      const byId = x => x.id;
-      const snap = {
-        events:   mergeByKey(data.events||[], qEvts, byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        pending:  (data.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        meds:     (data.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        food:     (data.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        medLib:   data.medLib||[],
-        foodLib:  data.foodLib||[],
-        checkins: (data.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-      };
-      setEvents(snap.events); setPending(snap.pending); setMeds(snap.meds);
-      setFood(snap.food); setMedLib(snap.medLib); setFoodLib(snap.foodLib);
-      setCheckins(snap.checkins);
-      saveLocalSnapshot(snap);
-      if (qEvts.length) {
-        drive.writeFile(fid, {...data, events: snap.events}).then(()=>clearQueue()).catch(()=>{});
-      }
-      setLastSynced(new Date().toISOString());
-      setAuthStatus('ready'); authStatusRef.current = 'ready';
-      setSyncStatus('synced');
-    } catch(e) {
-      const snap = loadLocalSnapshot();
-      if (snap) {
-        setEvents(snap.events||[]); setPending(snap.pending||[]); setMeds(snap.meds||[]);
-        setFood(snap.food||[]); setMedLib(snap.medLib||[]); setFoodLib(snap.foodLib||[]);
-        setCheckins(snap.checkins||[]);
-      }
-      setAuthStatus('ready'); authStatusRef.current = 'ready';
-      setSyncStatus('offline');
+      setAuthStatus('ready');
+      setSyncStatus(navigator.onLine?'stale':'offline');
+    } else {
+      setAuthStatus('needs-login');
     }
     document.getElementById('root-loader')?.remove();
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  },[]);
 
-  // ── doSilentRefresh: get a Google token without any UI ───────
-  // NEVER call this when offline — on Android PWA it opens a browser tab.
-  // Only call when: (a) we have no local data yet, or (b) token expired and we need Drive.
-  const doSilentRefresh = useCallback(() => {
-    if (!navigator.onLine) return;           // hard guard — never touch Google auth offline
-    if (!window.google?.accounts?.oauth2) return;
-    if (!clientIdRef.current) return;
-    try {
-      window.google.accounts.oauth2.initTokenClient({
-        client_id: clientIdRef.current,
-        scope: 'https://www.googleapis.com/auth/drive.file openid email profile',
-        prompt: 'none',
-        callback: (resp) => {
-          if (resp?.access_token) {
-            if (authStatusRef.current === 'ready') {
-              // App already visible — update Drive instance and sync
-              const drive = new DriveSync(resp.access_token);
-              setToken(resp.access_token);
-              setDriveInstance(drive);
-              setSyncStatus('stale');
-            } else {
-              loadFromDrive(resp.access_token);
-            }
-          } else {
-            // Silent auth failed — only show login if app not already displayed
-            if (authStatusRef.current !== 'ready') {
-              setAuthStatus('needs-login');
-              document.getElementById('root-loader')?.remove();
-            }
-          }
-        },
-        error_callback: () => {
-          if (authStatusRef.current !== 'ready') {
-            setAuthStatus('needs-login');
-            document.getElementById('root-loader')?.remove();
-          }
-        }
-      }).requestAccessToken();
-    } catch(e) {
-      if (authStatusRef.current !== 'ready') {
-        setAuthStatus('needs-login');
-        document.getElementById('root-loader')?.remove();
+  // ── getToken: lazily acquire a Drive token when needed ────
+  // Called only when online and a sync is required.
+  // Returns a token string or null if it can't get one silently.
+  const getToken = useCallback(()=> new Promise((resolve)=>{
+    if(!navigator.onLine){ resolve(null); return; }
+    const cid = localStorage.getItem('fnd_google_client_id');
+    if(!cid){ resolve(null); return; }
+    const tryGet = ()=>{
+      if(!window.google?.accounts?.oauth2){ resolve(null); return; }
+      try{
+        window.google.accounts.oauth2.initTokenClient({
+          client_id: cid,
+          scope: 'https://www.googleapis.com/auth/drive.file openid email profile',
+          prompt: 'none',
+          callback: (resp)=>{ resolve(resp?.access_token||null); },
+          error_callback: ()=>{ resolve(null); }
+        }).requestAccessToken();
+      }catch(e){ resolve(null); }
+    };
+    if(window.google?.accounts?.oauth2){
+      tryGet();
+    } else {
+      // GSI not loaded yet — load it then try
+      const existing = document.querySelector('script[src*="accounts.google.com/gsi"]');
+      if(!existing){
+        const s = document.createElement('script');
+        s.src = 'https://accounts.google.com/gsi/client';
+        s.onload = tryGet;
+        s.onerror = ()=>resolve(null);
+        document.head.appendChild(s);
+      } else {
+        // Script tag exists but not loaded yet — poll briefly
+        let i=0;
+        const t=setInterval(()=>{
+          if(window.google?.accounts?.oauth2){ clearInterval(t); tryGet(); }
+          else if(++i>20){ clearInterval(t); resolve(null); }
+        },200);
       }
     }
-  }, [loadFromDrive]);
+  }),[]);
 
-  // ── Token handler: called when user taps the sign-in button ──
-  const handleToken = useCallback(async (accessToken) => {
-    try {
+  // ── syncWithDrive: get token + sync, called explicitly ────
+  // This is the ONLY place we talk to Google. Never called at boot.
+  const syncWithDrive = useCallback(async (localState)=>{
+    if(!navigator.onLine){ setSyncStatus('offline'); return; }
+    if(isSyncing.current) return;
+    isSyncing.current=true; setSyncStatus('saving');
+    try{
+      // Get (or reuse) a token
+      let drive = driveRef.current;
+      if(!drive){
+        const token = await getToken();
+        if(!token){ setSyncStatus('error'); isSyncing.current=false; return; }
+        drive = new DriveSync(token);
+        driveRef.current = drive;
+        setToken(token);
+        setDriveInstance(drive);
+      }
+
+      // Ensure we have a file ID
+      let fid = fileIdRef.current;
+      if(!fid){
+        const result = await drive.init();
+        fid = result.fileId;
+        localStorage.setItem('fnd_file_id', fid);
+        setFileId(fid); fileIdRef.current = fid;
+        if(result.isNew) showFlash('New data file created in Drive 🎉');
+      }
+
+      // Read remote, merge, write
+      let remote;
+      try{ remote = await drive.readFile(fid); }
+      catch(e){
+        // File missing or token expired — reset file ID and retry once
+        localStorage.removeItem('fnd_file_id'); fileIdRef.current=null; fid=null;
+        driveRef.current=null; setDriveInstance(null);
+        const token2 = await getToken();
+        if(!token2){ setSyncStatus('error'); isSyncing.current=false; return; }
+        drive = new DriveSync(token2);
+        driveRef.current=drive; setToken(token2); setDriveInstance(drive);
+        const result = await drive.init();
+        fid=result.fileId; localStorage.setItem('fnd_file_id',fid);
+        setFileId(fid); fileIdRef.current=fid;
+        remote = result.data;
+      }
+
+      const byId = x=>x.id;
+      const mergeInto = (local,rem,kfn)=>{
+        const ids = new Set(local.map(kfn));
+        return [...local, ...rem.filter(x=>x&&!ids.has(kfn(x)))];
+      };
+      const q = loadQueue();
+      const qEvts = q.filter(x=>!x._type);
+
+      const merged = {
+        events:   mergeInto(localState.events||[],[...(remote.events||[]),...qEvts],byId)
+                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        pending:  [...(localState.pending||[])],
+        meds:     mergeInto(localState.meds||[],remote.meds||[],byId)
+                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        food:     mergeInto(localState.food||[],remote.food||[],byId)
+                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        medLib:   mergeInto(localState.medLib||[],remote.medLib||[],byId),
+        foodLib:  mergeInto(localState.foodLib||[],remote.foodLib||[],byId),
+        checkins: mergeInto(localState.checkins||[],
+                    (remote.checkins||[]).concat(q.filter(x=>x._type==='checkin')),byId)
+                  .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        version:1, lastModified:new Date().toISOString()
+      };
+
+      await drive.writeFile(fid, merged);
+      clearQueue(); setOfflineCount(0);
+      setEvents(merged.events); setPending(merged.pending);
+      setMeds(merged.meds); setFood(merged.food);
+      setMedLib(merged.medLib); setFoodLib(merged.foodLib);
+      setCheckins(merged.checkins);
+      saveLocalSnapshot(merged);
+      setLastSynced(new Date().toISOString());
+      setSyncStatus('synced');
+    }catch(e){
+      // Token probably expired — reset so next sync gets a fresh one
+      driveRef.current=null; setDriveInstance(null);
+      setSyncStatus('error');
+    }
+    finally{ isSyncing.current=false; }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[getToken]);
+
+  // Keep syncToDriveRef current
+  useEffect(()=>{ syncToDriveRef.current = syncWithDrive; },[syncWithDrive]);
+
+  // ── Token handler: sign-in button ─────────────────────────
+  const handleToken = useCallback(async (accessToken)=>{
+    try{
       const r = await fetch('https://www.googleapis.com/oauth2/v3/userinfo',
-        { headers: { Authorization: `Bearer ${accessToken}` } });
+        {headers:{Authorization:`Bearer ${accessToken}`}});
       const info = await r.json();
       setUserInfo(info);
       saveSession(info);
-    } catch(e) {}
-    await loadFromDrive(accessToken);
-  }, [loadFromDrive]);
-
-  // ── Boot: show app from local snapshot immediately if possible ─
-  // KEY RULE: if we have a session + snapshot, show the app and do NOT
-  // touch Google auth at all. Token refresh only happens when we need Drive.
-  useEffect(() => {
-    const session = loadSession();
-    const snap    = loadLocalSnapshot();
-    if (session && snap) {
-      // Perfect — show app immediately from local data, no network needed
-      setUserInfo(session);
-      setAuthStatus('ready'); authStatusRef.current = 'ready';
-      setSyncStatus(navigator.onLine ? 'stale' : 'offline');
-      document.getElementById('root-loader')?.remove();
-      // Do NOT call doSilentRefresh here — it can open a browser tab on Android.
-      // Token refresh happens lazily when user taps Sync or comes back online.
-    } else if (session && !snap) {
-      // Have session but no local data — need to fetch from Drive
-      setUserInfo(session);
-      // GSI effect will handle this — it calls doSilentRefresh only when
-      // authStatus is not 'ready' (i.e. we don't have data yet)
-    }
-    // No session → GSI effect will show sign-in screen
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
-
-  // ── GSI polling: wait for Google script, then act ─────────────
-  // Only calls doSilentRefresh if we don't already have local data showing.
-  // If app is already 'ready', GSI loading is a no-op on boot.
-  useEffect(() => {
-    if (gsiReady) {
-      // Only do silent refresh if the app isn't already showing from local snapshot
-      if (authStatusRef.current !== 'ready') {
-        doSilentRefresh();
-      }
-      return;
-    }
-    let attempts = 0;
-    const t = setInterval(() => {
-      attempts++;
-      if (window.google?.accounts?.oauth2) {
-        setGsiReady(true);
-        clearInterval(t);
-      } else if (attempts > 60) {
-        // 30s elapsed — device is offline, GSI won't load
-        clearInterval(t);
-        if (authStatusRef.current !== 'ready') {
-          const snap = loadLocalSnapshot();
-          if (snap) {
-            // Load from snapshot in offline mode
-            const session = loadSession();
-            if (session) setUserInfo(session);
-            const s = snap;
-            setEvents(s.events||[]); setPending(s.pending||[]); setMeds(s.meds||[]);
-            setFood(s.food||[]); setMedLib(s.medLib||[]); setFoodLib(s.foodLib||[]);
-            setCheckins(s.checkins||[]);
-            setAuthStatus('ready'); authStatusRef.current = 'ready';
-            setSyncStatus('offline');
-          } else {
-            // No session, no snapshot, no network — must wait for connectivity
-            setAuthStatus('needs-login');
-          }
-          document.getElementById('root-loader')?.remove();
-        }
-      }
-    }, 500);
-    return () => clearInterval(t);
-  }, [gsiReady, doSilentRefresh]);
-
-  // ── Periodic refresh: only when online AND app is open ────────
-  // Uses a much longer initial delay — no token request on app open.
-  // The visibilitychange handler only fires doSilentRefresh if we don't
-  // already have a valid driveInstance (i.e. token hasn't expired yet).
-  useEffect(() => {
-    if (authStatus !== 'ready') return;
-    // Only refresh token periodically — not on every foreground
-    const interval = setInterval(doSilentRefresh, 50 * 60 * 1000);
-    // On foreground: only sync data if we already have a drive instance.
-    // If driveInstance is null (token expired), do silent refresh to get a new one.
-    const onVisible = () => {
-      if (document.visibilityState !== 'visible' || !navigator.onLine) return;
-      if (driveInstance) {
-        // Have a valid token — just trigger a data sync
-        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-          if(syncToDriveRef.current) syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
-          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
-      } else {
-        // Token expired — silent refresh (this is fine since user is online)
-        doSilentRefresh();
-      }
-    };
-    document.addEventListener('visibilitychange', onVisible);
-    return () => { clearInterval(interval); document.removeEventListener('visibilitychange', onVisible); };
-  }, [authStatus, doSilentRefresh, driveInstance]);
-
-  // ── Core sync: write local state → merge in any NEW remote entries ──
-  // Local state is authoritative. Deletions and edits made locally are
-  // never overwritten by Drive. Only truly new records from Drive (items
-  // whose ID isn't in the local set) are merged in.
-  const syncToDrive=useCallback(async(localState)=>{
-    if(isSyncing.current||!driveInstance||!fileId)return;
-    if(!navigator.onLine){setSyncStatus('offline');return;}
-    isSyncing.current=true;setSyncStatus('saving');
+    }catch(e){}
+    // Load from Drive on first sign-in
+    const drive = new DriveSync(accessToken);
+    driveRef.current=drive; setToken(accessToken); setDriveInstance(drive);
     try{
-      const remote=await driveInstance.readFile(fileId);
-      const queued=loadQueue();
-
-      // Key functions for deduplication
-      const byId=x=>x.id;
-      const evtKey=e=>e.id;                // use ID as the key — more reliable than timestamp
-      const itemKey=e=>e.id;
-      const checkinKey=c=>c.id||c.timestamp;
-
-      // Helper: merge remote into local — only add items whose ID isn't already in local
-      // Local deletions are preserved because we start from localState, not from remote.
-      const mergeInto=(local,remote,keyFn)=>{
-        const localIds=new Set(local.map(keyFn));
-        const newRemote=remote.filter(x=>x&&!localIds.has(keyFn(x)));
-        return [...local,...newRemote];
+      let fid = fileIdRef.current; let data;
+      if(fid){ try{data=await drive.readFile(fid);}catch(e){localStorage.removeItem('fnd_file_id');fileIdRef.current=null;fid=null;} }
+      if(!fid){ const r=await drive.init();fid=r.fileId;data=r.data;localStorage.setItem('fnd_file_id',fid);setFileId(fid);fileIdRef.current=fid;if(r.isNew)showFlash('New data file created in Drive 🎉'); }
+      const q=loadQueue(); const qEvts=q.filter(x=>!x._type); const byId=x=>x.id;
+      const snap={
+        events:mergeByKey(data.events||[],qEvts,byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        pending:(data.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        meds:(data.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        food:(data.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        medLib:data.medLib||[], foodLib:data.foodLib||[],
+        checkins:(data.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp))
       };
-
-      const queuedEvents=queued.filter(x=>!x._type);
-
-      const merged={
-        events:mergeInto(localState.events||[],[...(remote.events||[]),...queuedEvents],evtKey)
-               .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        // pending: local is fully authoritative — never pull back deleted/moved items from Drive
-        pending:[...(localState.pending||[])],
-        meds:mergeInto(localState.meds||[],remote.meds||[],itemKey)
-             .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        food:mergeInto(localState.food||[],remote.food||[],itemKey)
-             .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        medLib:mergeInto(localState.medLib||[],remote.medLib||[],byId),
-        foodLib:mergeInto(localState.foodLib||[],remote.foodLib||[],byId),
-        checkins:mergeInto(
-          localState.checkins||[],
-          (remote.checkins||[]).concat(queued.filter(x=>x._type==="checkin")),
-          checkinKey
-        ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
-        version:1,
-        lastModified:new Date().toISOString()
-      };
-
-      await driveInstance.writeFile(fileId,merged);
-      clearQueue();setOfflineCount(0);
-
-      // Update local state with merged result
-      setEvents(merged.events);
-      setPending(merged.pending);
-      setMeds(merged.meds);
-      setFood(merged.food);
-      setMedLib(merged.medLib);
-      setFoodLib(merged.foodLib);
-      setCheckins(merged.checkins);
-      saveLocalSnapshot(merged);  // keep local copy up to date
+      setEvents(snap.events); setPending(snap.pending); setMeds(snap.meds);
+      setFood(snap.food); setMedLib(snap.medLib); setFoodLib(snap.foodLib); setCheckins(snap.checkins);
+      saveLocalSnapshot(snap);
+      if(qEvts.length) drive.writeFile(fid,{...data,events:snap.events}).then(()=>clearQueue()).catch(()=>{});
       setLastSynced(new Date().toISOString());
       setSyncStatus('synced');
-    }catch(e){setSyncStatus('error');}
-    finally{isSyncing.current=false;}
-  },[driveInstance,fileId]);
+    }catch(e){ setSyncStatus('offline'); }
+    setAuthStatus('ready');
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[]);
 
-  // scheduleSync now accepts explicit state so mutations are never stale.
-  // It ALWAYS saves a local snapshot first — this is the offline safety net.
-  // If offline, data is preserved in localStorage and synced on reconnect.
-  const scheduleSync=useCallback((explicitState)=>{
-    clearTimeout(syncTimer.current);
-    // Always persist locally first — this is what survives a closed app offline
-    if(explicitState) saveLocalSnapshot(explicitState);
-    setSyncStatus(navigator.onLine?'stale':'offline');
-    const snapshot=explicitState||null;
-    syncTimer.current=setTimeout(()=>{
-      if(snapshot){
-        syncToDrive(snapshot);
-      }else{
-        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-          const s={events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci};
-          saveLocalSnapshot(s);
-          syncToDrive(s);
-          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
-      }
-    },4000);
-  },[syncToDrive]);
-
-  // Online/offline sync trigger
+  // ── Online: trigger sync when connection restored ──────────
   useEffect(()=>{
     const onOnline=()=>{
       setSyncStatus('stale');
-      if(!driveInstance){
-        // No token yet — need to get one before we can sync
-        if(!window.google?.accounts?.oauth2){
-          // GSI not loaded yet (was offline at boot) — load it now
-          const script=document.createElement('script');
-          script.src='https://accounts.google.com/gsi/client';
-          script.onload=()=>{ setGsiReady(true); };
-          document.head.appendChild(script);
-        } else {
-          doSilentRefresh();
-        }
-      } else {
-        // Have token — just sync data
-        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-          if(syncToDriveRef.current) syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
-          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
-      }
+      // Trigger a sync using current state
+      setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+        if(syncToDriveRef.current)
+          syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+        return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
     };
     const onOffline=()=>setSyncStatus('offline');
     window.addEventListener('online',onOnline);
     window.addEventListener('offline',onOffline);
     return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);};
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[driveInstance,doSilentRefresh]);
+  },[]);
+
+  // ── Visibility: sync when app comes to foreground ─────────
+  useEffect(()=>{
+    if(authStatus!=='ready') return;
+    const onVisible=()=>{
+      if(document.visibilityState!=='visible'||!navigator.onLine) return;
+      setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+        if(syncToDriveRef.current)
+          syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+        return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
+    };
+    document.addEventListener('visibilitychange',onVisible);
+    return()=>document.removeEventListener('visibilitychange',onVisible);
+  },[authStatus]);
+
+  // ── scheduleSync: save locally then sync to Drive ─────────
+  // Always saves to localStorage first (offline safety).
+  // Drive sync is attempted after 2s debounce, only when online.
+  const scheduleSync=useCallback((explicitState)=>{
+    clearTimeout(syncTimer.current);
+    if(explicitState) saveLocalSnapshot(explicitState);
+    setSyncStatus(navigator.onLine?'stale':'offline');
+    syncTimer.current=setTimeout(()=>{
+      if(explicitState){
+        syncWithDrive(explicitState);
+      }else{
+        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+          const s={events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci};
+          saveLocalSnapshot(s);
+          syncWithDrive(s);
+          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
+      }
+    },2000);
+  },[syncWithDrive]);
 
   // ── Data mutation helpers ─────────────────────────────────
   const addEvent=e=>{const n=[e,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(n);scheduleSync({events:n,pending,meds,food,medLib,foodLib,checkins});showFlash("⚡ Event logged");};
@@ -1863,7 +1781,7 @@ function App(){
     window.location.reload();
   };
   const manualSync=()=>{
-    syncToDrive({events,pending,meds,food,medLib,foodLib,checkins})
+    syncWithDrive({events,pending,meds,food,medLib,foodLib,checkins})
       .then(()=>showFlash("☁️ Synced ✓"));
   };
 
@@ -1882,24 +1800,17 @@ function App(){
   const reviewing=modal==="review"&&pending[revIdx];
 
   // ── Render gate ───────────────────────────────────────────
-  // Rule: the ONLY thing that shows the sign-in screen is having no stored session.
-  // A missing token, expired token, or no network connection must never block the app.
+  // boot   = reading localStorage (very brief, no flicker)
+  // needs-login = no session stored, show sign-in
+  // ready  = show the app (works online and offline)
   if(!clientId)return <ClientIdSetup onSave={setClientId}/>;
   if(authStatus==='boot')return(
     <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",color:C.green,gap:12,background:C.bg}}>
       <div style={{fontSize:"2rem"}}>⚡</div>
       <div style={{fontWeight:700}}>FND Tracker</div>
-      <div style={{color:C.muted,fontSize:13}}>Loading…</div>
     </div>
   );
   if(authStatus==='needs-login')return <AuthScreen clientId={clientId} onToken={handleToken}/>;
-  if(authStatus==='loading-drive')return(
-    <div style={{display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",height:"100vh",color:C.green,gap:12,background:C.bg}}>
-      <div style={{fontSize:"2rem"}}>⚡</div>
-      <div style={{fontWeight:700}}>FND Tracker</div>
-      <div style={{color:C.muted,fontSize:13}}>Syncing with Drive…</div>
-    </div>
-  );
 
   // ── Sync status label ─────────────────────────────────────
   const syncLabel=syncStatus==='saving'?'Saving…':syncStatus==='offline'&&offlineCount>0?`${offlineCount} queued`:syncStatus==='offline'?'Offline':syncStatus==='stale'?'Pending':syncStatus==='error'?'Sync error':'☁️ Drive';
