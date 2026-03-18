@@ -1088,6 +1088,7 @@ function buildReport(events,meds,food){
    ═══════════════════════════════════════════════════════════ */
 function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut}){
   const[confirmReset,setConfirmReset]=useState(false);
+  const[confirmSignOut,setConfirmSignOut]=useState(false);
   const[importState,setImportState]=useState(null);
   const[importError,setImportError]=useState(null);
   const[showFormat,setShowFormat]=useState(false);
@@ -1314,7 +1315,17 @@ function ExportTab({events,meds,food,onReset,onImport,userInfo,onSignOut}){
           {userInfo?.picture&&<img src={userInfo.picture} style={{width:40,height:40,borderRadius:"50%"}} alt=""/>}
           <div><div style={{fontWeight:600,fontSize:14}}>{userInfo?.name||"Signed in"}</div><div style={{color:C.muted,fontSize:12}}>{userInfo?.email}</div></div>
         </div>
-        <Btn onClick={onSignOut} variant="secondary" fullWidth>Sign Out</Btn>
+        {confirmSignOut?(
+          <div>
+            <div style={{color:C.amber,fontSize:13,marginBottom:10,lineHeight:1.5}}>Sign out? You'll need to sign in again to sync with Drive.</div>
+            <div style={{display:"flex",gap:8}}>
+              <Btn onClick={()=>setConfirmSignOut(false)} variant="secondary" fullWidth>Cancel</Btn>
+              <Btn onClick={onSignOut} danger fullWidth>Yes, Sign Out</Btn>
+            </div>
+          </div>
+        ):(
+          <Btn onClick={()=>setConfirmSignOut(true)} variant="secondary" fullWidth>Sign Out</Btn>
+        )}
       </div>
 
       {/* Reset */}
@@ -1724,10 +1735,10 @@ function App(){
       scheduleSync({events:ne,pending,meds:nm,food:nf,medLib,foodLib,checkins});showFlash(`✅ Merged — ${added} new record${added!==1?"s":""} added`);
     }
   };
+  const[confirmingSignOut,setConfirmingSignOut]=useState(false);
   const signOut=()=>{
-    if(!window.confirm("Sign out?"))return;
     if(window.google?.accounts?.oauth2&&token){
-      window.google.accounts.oauth2.revoke(token,()=>{});
+      try{ window.google.accounts.oauth2.revoke(token,()=>{}); }catch(e){}
     }
     clearSession();
     localStorage.removeItem('fnd_file_id');
