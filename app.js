@@ -1506,10 +1506,10 @@ function App(){
   }, []);
 
   // ── doSilentRefresh: get a Google token without any UI ───────
-  // Safe to call any time. If app is already showing it just syncs.
-  // If app isn't showing yet it calls loadFromDrive.
-  // On failure it shows sign-in screen only if app isn't already visible.
+  // NEVER call this when offline — on Android PWA it opens a browser tab.
+  // Only call when: (a) we have no local data yet, or (b) token expired and we need Drive.
   const doSilentRefresh = useCallback(() => {
+    if (!navigator.onLine) return;           // hard guard — never touch Google auth offline
     if (!window.google?.accounts?.oauth2) return;
     if (!clientIdRef.current) return;
     try {
@@ -1520,7 +1520,7 @@ function App(){
         callback: (resp) => {
           if (resp?.access_token) {
             if (authStatusRef.current === 'ready') {
-              // App already visible — just update Drive instance and mark stale
+              // App already visible — update Drive instance and sync
               const drive = new DriveSync(resp.access_token);
               setToken(resp.access_token);
               setDriveInstance(drive);
@@ -1564,34 +1564,45 @@ function App(){
   }, [loadFromDrive]);
 
   // ── Boot: show app from local snapshot immediately if possible ─
+  // KEY RULE: if we have a session + snapshot, show the app and do NOT
+  // touch Google auth at all. Token refresh only happens when we need Drive.
   useEffect(() => {
     const session = loadSession();
     const snap    = loadLocalSnapshot();
     if (session && snap) {
-      // Have everything — show app immediately, no network needed
+      // Perfect — show app immediately from local data, no network needed
       setUserInfo(session);
       setAuthStatus('ready'); authStatusRef.current = 'ready';
       setSyncStatus(navigator.onLine ? 'stale' : 'offline');
       document.getElementById('root-loader')?.remove();
-    } else if (session) {
-      // Have session but no local data — setUserInfo, then GSI will fetch Drive
+      // Do NOT call doSilentRefresh here — it can open a browser tab on Android.
+      // Token refresh happens lazily when user taps Sync or comes back online.
+    } else if (session && !snap) {
+      // Have session but no local data — need to fetch from Drive
       setUserInfo(session);
+      // GSI effect will handle this — it calls doSilentRefresh only when
+      // authStatus is not 'ready' (i.e. we don't have data yet)
     }
-    // In all cases the GSI effect below will run doSilentRefresh once GSI loads
+    // No session → GSI effect will show sign-in screen
   // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // ── GSI polling: wait for Google script, then doSilentRefresh ─
+  // ── GSI polling: wait for Google script, then act ─────────────
+  // Only calls doSilentRefresh if we don't already have local data showing.
+  // If app is already 'ready', GSI loading is a no-op on boot.
   useEffect(() => {
     if (gsiReady) {
-      doSilentRefresh();
+      // Only do silent refresh if the app isn't already showing from local snapshot
+      if (authStatusRef.current !== 'ready') {
+        doSilentRefresh();
+      }
       return;
     }
     let attempts = 0;
     const t = setInterval(() => {
       attempts++;
       if (window.google?.accounts?.oauth2) {
-        setGsiReady(true); // re-runs this effect with gsiReady=true → doSilentRefresh
+        setGsiReady(true);
         clearInterval(t);
       } else if (attempts > 60) {
         // 30s elapsed — device is offline, GSI won't load
@@ -1599,11 +1610,17 @@ function App(){
         if (authStatusRef.current !== 'ready') {
           const snap = loadLocalSnapshot();
           if (snap) {
-            // Have local data — show app in offline mode
+            // Load from snapshot in offline mode
+            const session = loadSession();
+            if (session) setUserInfo(session);
+            const s = snap;
+            setEvents(s.events||[]); setPending(s.pending||[]); setMeds(s.meds||[]);
+            setFood(s.food||[]); setMedLib(s.medLib||[]); setFoodLib(s.foodLib||[]);
+            setCheckins(s.checkins||[]);
             setAuthStatus('ready'); authStatusRef.current = 'ready';
             setSyncStatus('offline');
           } else {
-            // Nothing — must sign in when online
+            // No session, no snapshot, no network — must wait for connectivity
             setAuthStatus('needs-login');
           }
           document.getElementById('root-loader')?.remove();
@@ -1613,16 +1630,31 @@ function App(){
     return () => clearInterval(t);
   }, [gsiReady, doSilentRefresh]);
 
-  // ── Periodic refresh: every 50 min + on app foreground ────────
+  // ── Periodic refresh: only when online AND app is open ────────
+  // Uses a much longer initial delay — no token request on app open.
+  // The visibilitychange handler only fires doSilentRefresh if we don't
+  // already have a valid driveInstance (i.e. token hasn't expired yet).
   useEffect(() => {
     if (authStatus !== 'ready') return;
+    // Only refresh token periodically — not on every foreground
     const interval = setInterval(doSilentRefresh, 50 * 60 * 1000);
+    // On foreground: only sync data if we already have a drive instance.
+    // If driveInstance is null (token expired), do silent refresh to get a new one.
     const onVisible = () => {
-      if (document.visibilityState === 'visible' && navigator.onLine) doSilentRefresh();
+      if (document.visibilityState !== 'visible' || !navigator.onLine) return;
+      if (driveInstance) {
+        // Have a valid token — just trigger a data sync
+        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+          if(syncToDriveRef.current) syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
+      } else {
+        // Token expired — silent refresh (this is fine since user is online)
+        doSilentRefresh();
+      }
     };
     document.addEventListener('visibilitychange', onVisible);
     return () => { clearInterval(interval); document.removeEventListener('visibilitychange', onVisible); };
-  }, [authStatus, doSilentRefresh]);
+  }, [authStatus, doSilentRefresh, driveInstance]);
 
   // ── Core sync: write local state → merge in any NEW remote entries ──
   // Local state is authoritative. Deletions and edits made locally are
@@ -1714,30 +1746,32 @@ function App(){
 
   // Online/offline sync trigger
   useEffect(()=>{
-    const triggerSync=()=>{
-      setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-        syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
-        return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
-    };
     const onOnline=()=>{
       setSyncStatus('stale');
-      // If GSI wasn't loaded when the app opened (was offline), reload it now
-      if(!window.google?.accounts?.oauth2){
-        const script=document.createElement('script');
-        script.src='https://accounts.google.com/gsi/client';
-        script.onload=()=>{ setGsiReady(true); }; // triggers GSI effect → doSilentRefresh
-        document.head.appendChild(script);
+      if(!driveInstance){
+        // No token yet — need to get one before we can sync
+        if(!window.google?.accounts?.oauth2){
+          // GSI not loaded yet (was offline at boot) — load it now
+          const script=document.createElement('script');
+          script.src='https://accounts.google.com/gsi/client';
+          script.onload=()=>{ setGsiReady(true); };
+          document.head.appendChild(script);
+        } else {
+          doSilentRefresh();
+        }
       } else {
-        doSilentRefresh();
+        // Have token — just sync data
+        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+          if(syncToDriveRef.current) syncToDriveRef.current({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
       }
-      triggerSync();
     };
     const onOffline=()=>setSyncStatus('offline');
     window.addEventListener('online',onOnline);
     window.addEventListener('offline',onOffline);
     return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);};
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  },[syncToDrive,doSilentRefresh]);
+  },[driveInstance,doSilentRefresh]);
 
   // ── Data mutation helpers ─────────────────────────────────
   const addEvent=e=>{const n=[e,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(n);scheduleSync({events:n,pending,meds,food,medLib,foodLib,checkins});showFlash("⚡ Event logged");};
