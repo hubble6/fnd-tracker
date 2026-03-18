@@ -11,6 +11,16 @@ function loadQueue() { try { return JSON.parse(localStorage.getItem(QUEUE_KEY)||
 function saveQueue(q) { localStorage.setItem(QUEUE_KEY, JSON.stringify(q)); }
 function clearQueue() { localStorage.removeItem(QUEUE_KEY); }
 
+// Full local data snapshot — persisted independently of the queue
+// so the app can load data even when Drive/auth is unavailable
+const LOCAL_DATA_KEY = 'fnd_local_snapshot';
+function saveLocalSnapshot(data) {
+  try { localStorage.setItem(LOCAL_DATA_KEY, JSON.stringify({...data, _savedAt: new Date().toISOString()})); } catch(e) {}
+}
+function loadLocalSnapshot() {
+  try { return JSON.parse(localStorage.getItem(LOCAL_DATA_KEY)||'null'); } catch { return null; }
+}
+
 class DriveSync {
   constructor(token) { this.token = token; }
   async req(url, opts={}) {
@@ -1470,26 +1480,30 @@ function App(){
       setMedLib(merged.medLib);
       setFoodLib(merged.foodLib);
       setCheckins(merged.checkins);
+      saveLocalSnapshot(merged);  // keep local copy up to date
       setLastSynced(new Date().toISOString());
       setSyncStatus('synced');
     }catch(e){setSyncStatus('error');}
     finally{isSyncing.current=false;}
   },[driveInstance,fileId]);
 
-  // scheduleSync now accepts explicit state so mutations are never stale
+  // scheduleSync now accepts explicit state so mutations are never stale.
+  // It ALWAYS saves a local snapshot first — this is the offline safety net.
+  // If offline, data is preserved in localStorage and synced on reconnect.
   const scheduleSync=useCallback((explicitState)=>{
     clearTimeout(syncTimer.current);
+    // Always persist locally first — this is what survives a closed app offline
+    if(explicitState) saveLocalSnapshot(explicitState);
     setSyncStatus(navigator.onLine?'stale':'offline');
-    // Capture the state at call time into the closure — no nested setState reads
     const snapshot=explicitState||null;
     syncTimer.current=setTimeout(()=>{
       if(snapshot){
-        // We have a fresh snapshot from the mutation — use it directly
         syncToDrive(snapshot);
       }else{
-        // Fallback: read current state via nested setState updaters
         setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
-          syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+          const s={events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci};
+          saveLocalSnapshot(s);
+          syncToDrive(s);
           return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
       }
     },4000);
@@ -1522,9 +1536,9 @@ function App(){
       // Load state from Drive, merged with any offline queue
       const q=loadQueue();
       const qEvts=q.filter(x=>!x._type);
-      // Use ID-based merge (same as syncToDrive) — not timestamp-based
       const byId=x=>x.id;
-      setEvents(mergeByKey((data.events||[]),qEvts,byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      const mergedEvents=mergeByKey((data.events||[]),qEvts,byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      setEvents(mergedEvents);
       setPending((data.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setMeds((data.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setFood((data.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
@@ -1535,9 +1549,28 @@ function App(){
         const merged={...data,events:mergeByKey((data.events||[]),qEvts,byId)};
         drive.writeFile(fid,merged).then(()=>clearQueue()).catch(()=>{});
       }
+      saveLocalSnapshot({events:mergedEvents,pending:data.pending||[],meds:data.meds||[],food:data.food||[],medLib:data.medLib||[],foodLib:data.foodLib||[],checkins:data.checkins||[]});
       setLastSynced(new Date().toISOString());setAuthStatus('ready');
       document.getElementById('root-loader')?.remove();
-    }catch(e){setAuthError(e.message);setAuthStatus('error');}
+    }catch(e){
+      // Drive unreachable — try loading from local snapshot so app still works offline
+      const snap=loadLocalSnapshot();
+      if(snap){
+        setEvents(snap.events||[]);
+        setPending(snap.pending||[]);
+        setMeds(snap.meds||[]);
+        setFood(snap.food||[]);
+        setMedLib(snap.medLib||[]);
+        setFoodLib(snap.foodLib||[]);
+        setCheckins(snap.checkins||[]);
+        setSyncStatus('offline');
+        setAuthStatus('ready');
+        showFlash("Offline — loaded local data",C.amber);
+        document.getElementById('root-loader')?.remove();
+      }else{
+        setAuthError(e.message);setAuthStatus('error');
+      }
+    }
   }
 
   // ── Data mutation helpers ─────────────────────────────────
