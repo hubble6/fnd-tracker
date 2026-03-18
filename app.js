@@ -70,13 +70,11 @@ const fmtDate  = iso => new Date(iso).toLocaleDateString([],{month:"short",day:"
 const fmtFull  = iso => `${fmtDate(iso)} ${fmtTime(iso)}`;
 const nowISO   = ()  => new Date().toISOString();
 const localISO = (d=new Date()) => { const off=d.getTimezoneOffset()*60000; return new Date(d-off).toISOString().slice(0,16); };
-const uid      = ()  => Date.now()+Math.random();
+const uid = () => (typeof crypto!=='undefined'&&crypto.randomUUID) ? crypto.randomUUID() : Date.now().toString(36)+Math.random().toString(36).slice(2);
 const toYMD    = d   => { const p=n=>String(n).padStart(2,'0'); return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}`; };
 
 function startOf(unit,d=new Date()){const x=new Date(d);x.setHours(0,0,0,0);if(unit==="week")x.setDate(x.getDate()-x.getDay());if(unit==="month")x.setDate(1);return x;}
 function filterFrom(items,start){return items.filter(e=>new Date(e.timestamp)>=start);}
-function groupByDay(items){const g={};items.forEach(e=>{const k=fmtDate(e.timestamp);g[k]=(g[k]||0)+1;});return g;}
-function daysRange(start,end){const days=[],cur=new Date(start);while(cur<=end){days.push(fmtDate(cur.toISOString()));cur.setDate(cur.getDate()+1);}return days;}
 function loggedBefore(items,ts,hours=4){const t=new Date(ts),cut=new Date(t-hours*3600000);return items.filter(e=>{const d=new Date(e.timestamp);return d>=cut&&d<=t;});}
 function useDesktop(){const[v,setV]=useState(()=>window.innerWidth>=768);useEffect(()=>{const fn=()=>setV(window.innerWidth>=768);window.addEventListener('resize',fn);return()=>window.removeEventListener('resize',fn);},[]);return v;}
 function useChartFont(){const[w,setW]=useState(()=>window.innerWidth);useEffect(()=>{const fn=()=>setW(window.innerWidth);window.addEventListener('resize',fn);return()=>window.removeEventListener('resize',fn);},[]);const cf=(base)=>Math.round(Math.max(base,Math.min(base*2,base+(w-320)/120)));return{axisLabel:cf(9),barLabel:cf(10),chartSub:cf(9),legend:cf(10),annotation:cf(11)};}
@@ -166,6 +164,11 @@ function DateTimePicker({value,onChange}){
   const[step,setStep]=useState("hour");
   const[selH,setSelH]=useState(initH);
   const[selM,setSelM]=useState(initM);
+  // Sync slider state if the value prop changes externally (e.g. quick-time buttons)
+  useEffect(()=>{
+    const tv=value?value.split("T")[1]||"":"";
+    if(tv){setSelH(parseInt(tv.split(":")[0]));setSelM(parseInt(tv.split(":")[1]));}
+  },[value]);
   const pad=n=>String(n).padStart(2,"0");
   const fmt12=h=>({h12:h%12||12,ap:h>=12?"PM":"AM"});
   const{h12,ap}=fmt12(selH);
@@ -570,7 +573,8 @@ function TrendsTab({events,food}){
   if(cur.length)clusters.push(cur);
   const clustered=clusters.filter(c=>c.length>=2);
   const bigClusters=clusters.filter(c=>c.length>=5);
-  const isolated=evts.length-clustered.reduce((s,c)=>s+c.length,0);
+  const eventsInClusters=clustered.reduce((s,c)=>s+c.length,0);
+  const isolated=evts.length-eventsInClusters;
   const minsOfDay=evts.map(e=>{const t=new Date(e.timestamp);return t.getHours()*60+t.getMinutes();});
   const buckets=Array.from({length:8},(_,i)=>{const startH=i*3;const count=minsOfDay.filter(m=>m>=startH*60&&m<(startH+3)*60).length;const label=["12-3a","3-6a","6-9a","9a-12p","12-3p","3-6p","6-9p","9p-12a"][i];return{label,count,startM:startH*60};});
   const maxB=Math.max(1,...buckets.map(b=>b.count));
@@ -595,7 +599,17 @@ function TrendsTab({events,food}){
     <button onClick={()=>setSection(id)} style={{flex:1,padding:"7px 0",borderRadius:8,cursor:"pointer",fontSize:12,fontWeight:700,background:section===id?C.card:"transparent",color:section===id?C.text:C.muted,border:"none"}}>{label}</button>
   );
   // Week/Month/Year trend strips
-  const weekTrend=Array.from({length:8},(_,wi)=>{const wOff=offset+7-wi;const end=new Date();end.setDate(end.getDate()-wOff*7+6);end.setHours(23,59,59,999);const start=new Date(end);start.setDate(start.getDate()-6);start.setHours(0,0,0,0);return events.filter(e=>{const t=new Date(e.timestamp);return t>=start&&t<=end;}).length;});
+  // weekTrend: 8 complete Mon-Sun weeks, index 7 = most recent completed+current week
+  const weekTrend=Array.from({length:8},(_,wi)=>{
+    const weeksAgo=7-wi+offset;
+    const end=new Date();
+    end.setDate(end.getDate()-weeksAgo*7);
+    end.setHours(23,59,59,999);
+    const start=new Date(end);
+    start.setDate(start.getDate()-6);
+    start.setHours(0,0,0,0);
+    return events.filter(e=>{const t=new Date(e.timestamp);return t>=start&&t<=end;}).length;
+  });
   const monthTrend=Array.from({length:8},(_,mi)=>{const ref=new Date();ref.setDate(1);ref.setMonth(ref.getMonth()-(offset+7-mi));const start=new Date(ref);start.setHours(0,0,0,0);const end=new Date(ref.getFullYear(),ref.getMonth()+1,0,23,59,59,999);return{cnt:events.filter(e=>{const t=new Date(e.timestamp);return t>=start&&t<=end;}).length,label:ref.toLocaleDateString([],{month:"short"})};});
   return(
     <div>
@@ -1214,10 +1228,10 @@ function App(){
     return()=>clearInterval(t);
   },[gsiReady]);
 
-  // ── Build data object from state ─────────────────────────
-  const getDataObj=useCallback(()=>({events,pending,meds,food,medLib,foodLib,checkins,version:1}),[events,pending,meds,food,medLib,foodLib,checkins]);
-
-  // ── Core sync: read Drive → merge → write ────────────────
+  // ── Core sync: write local state → merge in any NEW remote entries ──
+  // Local state is authoritative. Deletions and edits made locally are
+  // never overwritten by Drive. Only truly new records from Drive (items
+  // whose ID isn't in the local set) are merged in.
   const syncToDrive=useCallback(async(localState)=>{
     if(isSyncing.current||!driveInstance||!fileId)return;
     if(!navigator.onLine){setSyncStatus('offline');return;}
@@ -1225,46 +1239,89 @@ function App(){
     try{
       const remote=await driveInstance.readFile(fileId);
       const queued=loadQueue();
-      const evtKey=e=>new Date(e.timestamp).toISOString().slice(0,16);
-      const itemKey=e=>`${new Date(e.timestamp).toISOString().slice(0,16)}|${(e.name||"").toLowerCase()}`;
+
+      // Key functions for deduplication
+      const byId=x=>x.id;
+      const evtKey=e=>e.id;                // use ID as the key — more reliable than timestamp
+      const itemKey=e=>e.id;
       const checkinKey=c=>c.id||c.timestamp;
-      const merged={
-        events:mergeByKey(remote.events||[],localState.events||[],evtKey),
-        pending:mergeByKey(remote.pending||[],localState.pending||[],evtKey),
-        meds:mergeByKey(remote.meds||[],localState.meds||[],itemKey),
-        food:mergeByKey(remote.food||[],localState.food||[],itemKey),
-        medLib:mergeByKey(remote.medLib||[],localState.medLib||[],x=>x.id),
-        foodLib:mergeByKey(remote.foodLib||[],localState.foodLib||[],x=>x.id),
-        checkins:mergeByKey(remote.checkins||[],(localState.checkins||[]).concat(queued.filter(x=>x._type==="checkin")),checkinKey),
-        version:1
+
+      // Helper: merge remote into local — only add items whose ID isn't already in local
+      // Local deletions are preserved because we start from localState, not from remote.
+      const mergeInto=(local,remote,keyFn)=>{
+        const localIds=new Set(local.map(keyFn));
+        const newRemote=remote.filter(x=>x&&!localIds.has(keyFn(x)));
+        return [...local,...newRemote];
       };
-      // also merge any queued events
+
       const queuedEvents=queued.filter(x=>!x._type);
-      if(queuedEvents.length)merged.events=mergeByKey(merged.events,queuedEvents,evtKey);
+
+      const merged={
+        events:mergeInto(localState.events||[],[...(remote.events||[]),...queuedEvents],evtKey)
+               .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        // pending: local is fully authoritative — never pull back deleted/moved items from Drive
+        pending:[...(localState.pending||[])],
+        meds:mergeInto(localState.meds||[],remote.meds||[],itemKey)
+             .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        food:mergeInto(localState.food||[],remote.food||[],itemKey)
+             .sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        medLib:mergeInto(localState.medLib||[],remote.medLib||[],byId),
+        foodLib:mergeInto(localState.foodLib||[],remote.foodLib||[],byId),
+        checkins:mergeInto(
+          localState.checkins||[],
+          (remote.checkins||[]).concat(queued.filter(x=>x._type==="checkin")),
+          checkinKey
+        ).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)),
+        version:1,
+        lastModified:new Date().toISOString()
+      };
+
       await driveInstance.writeFile(fileId,merged);
       clearQueue();setOfflineCount(0);
-      setEvents([...merged.events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      setPending([...merged.pending].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      setMeds([...merged.meds].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      setFood([...merged.food].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      setMedLib(merged.medLib||[]);setFoodLib(merged.foodLib||[]);
-      setCheckins([...merged.checkins].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      setLastSynced(new Date().toISOString());setSyncStatus('synced');
+
+      // Update local state with merged result
+      setEvents(merged.events);
+      setPending(merged.pending);
+      setMeds(merged.meds);
+      setFood(merged.food);
+      setMedLib(merged.medLib);
+      setFoodLib(merged.foodLib);
+      setCheckins(merged.checkins);
+      setLastSynced(new Date().toISOString());
+      setSyncStatus('synced');
     }catch(e){setSyncStatus('error');}
-    isSyncing.current=false;
+    finally{isSyncing.current=false;}
   },[driveInstance,fileId]);
 
-  const scheduleSync=useCallback(()=>{
+  // scheduleSync now accepts explicit state so mutations are never stale
+  const scheduleSync=useCallback((explicitState)=>{
     clearTimeout(syncTimer.current);
     setSyncStatus(navigator.onLine?'stale':'offline');
-    syncTimer.current=setTimeout(()=>{setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});},4000);
+    // Capture the state at call time into the closure — no nested setState reads
+    const snapshot=explicitState||null;
+    syncTimer.current=setTimeout(()=>{
+      if(snapshot){
+        // We have a fresh snapshot from the mutation — use it directly
+        syncToDrive(snapshot);
+      }else{
+        // Fallback: read current state via nested setState updaters
+        setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+          syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+          return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
+      }
+    },4000);
   },[syncToDrive]);
 
   // Online/offline + visibility
   useEffect(()=>{
-    const onOnline=()=>{setSyncStatus('stale');setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});};
+    const triggerSync=()=>{
+      setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{
+        syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci});
+        return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});
+    };
+    const onOnline=()=>{setSyncStatus('stale');triggerSync();};
     const onOffline=()=>setSyncStatus('offline');
-    const onVisible=()=>{if(document.visibilityState==='visible'&&navigator.onLine)onOnline();};
+    const onVisible=()=>{if(document.visibilityState==='visible'&&navigator.onLine)triggerSync();};
     window.addEventListener('online',onOnline);window.addEventListener('offline',onOffline);document.addEventListener('visibilitychange',onVisible);
     return()=>{window.removeEventListener('online',onOnline);window.removeEventListener('offline',onOffline);document.removeEventListener('visibilitychange',onVisible);};
   },[syncToDrive]);
@@ -1281,73 +1338,110 @@ function App(){
       if(!fid){const result=await drive.init();fid=result.fileId;data=result.data;localStorage.setItem('fnd_file_id',fid);setFileId(fid);if(result.isNew)showFlash("New data file created in Drive 🎉");}
       // Load state from Drive, merged with any offline queue
       const q=loadQueue();
-      const evtKey=e=>new Date(e.timestamp).toISOString().slice(0,16);
-      const itemKey=e=>`${new Date(e.timestamp).toISOString().slice(0,16)}|${(e.name||"").toLowerCase()}`;
       const qEvts=q.filter(x=>!x._type);
-      setEvents(mergeByKey((data.events||[]),qEvts,evtKey).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      // Use ID-based merge (same as syncToDrive) — not timestamp-based
+      const byId=x=>x.id;
+      setEvents(mergeByKey((data.events||[]),qEvts,byId).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setPending((data.pending||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setMeds((data.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setFood((data.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setMedLib(data.medLib||[]);setFoodLib(data.foodLib||[]);
       setCheckins((data.checkins||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
+      // If there were queued events, write them to Drive now
+      if(qEvts.length){
+        const merged={...data,events:mergeByKey((data.events||[]),qEvts,byId)};
+        drive.writeFile(fid,merged).then(()=>clearQueue()).catch(()=>{});
+      }
       setLastSynced(new Date().toISOString());setAuthStatus('ready');
       document.getElementById('root-loader')?.remove();
     }catch(e){setAuthError(e.message);setAuthStatus('error');}
   }
 
   // ── Data mutation helpers ─────────────────────────────────
-  const addEvent=e=>{const n=[e,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(n);scheduleSync();showFlash("⚡ Event logged");};
-  const addMed=e=>{const n=[e,...meds].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setMeds(n);scheduleSync();showFlash("💊 Medication logged",C.purple);};
-  const addFood=e=>{const n=[e,...food].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setFood(n);scheduleSync();showFlash("🍽 Meal logged",C.teal);};
-  const addCheckin=async c=>{const n=[c,...checkins];setCheckins(n);scheduleSync();showFlash("✓ Check-in saved");};
-  const delEvent=id=>{const n=events.filter(e=>e.id!==id);setEvents(n);scheduleSync();};
-  const delPending=id=>{const n=pending.filter(e=>e.id!==id);setPending(n);scheduleSync();};
-  const delMed=id=>{const n=meds.filter(e=>e.id!==id);setMeds(n);scheduleSync();};
-  const delFood=id=>{const n=food.filter(e=>e.id!==id);setFood(n);scheduleSync();};
-  const saveMedLib=lib=>{const clean=(lib||[]).filter(Boolean);setMedLib(clean);scheduleSync();};
-  const saveFoodLib=lib=>{const clean=(lib||[]).filter(Boolean);setFoodLib(clean);scheduleSync();};
-  const updateEvent=updated=>{const np=pending.filter(e=>e.id!==updated.id);setPending(np);const ne=[updated,...events.filter(e=>e.id!==updated.id)].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(ne);setEditing(null);scheduleSync();showFlash("✅ Event updated");};
-  const updateMed=updated=>{const n=meds.map(e=>e.id===updated.id?updated:e).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setMeds(n);setEditing(null);scheduleSync();showFlash("✅ Medication updated",C.purple);};
-  const updateFood=updated=>{const n=food.map(e=>e.id===updated.id?updated:e).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setFood(n);setEditing(null);scheduleSync();showFlash("✅ Meal updated",C.teal);};
+  const addEvent=e=>{const n=[e,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(n);scheduleSync({events:n,pending,meds,food,medLib,foodLib,checkins});showFlash("⚡ Event logged");};
+  const addMed=e=>{const n=[e,...meds].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setMeds(n);scheduleSync({events,pending,meds:n,food,medLib,foodLib,checkins});showFlash("💊 Medication logged",C.purple);};
+  const addFood=e=>{const n=[e,...food].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setFood(n);scheduleSync({events,pending,meds,food:n,medLib,foodLib,checkins});showFlash("🍽 Meal logged",C.teal);};
+  const addCheckin=async c=>{const n=[c,...checkins];setCheckins(n);scheduleSync({events,pending,meds,food,medLib,foodLib,checkins:n});showFlash("✓ Check-in saved");};
+  const delEvent=id=>{const n=events.filter(e=>e.id!==id);setEvents(n);scheduleSync({events:n,pending,meds,food,medLib,foodLib,checkins});};
+  const delPending=id=>{const n=pending.filter(e=>e.id!==id);setPending(n);scheduleSync({events,pending:n,meds,food,medLib,foodLib,checkins});};
+  const delMed=id=>{const n=meds.filter(e=>e.id!==id);setMeds(n);scheduleSync({events,pending,meds:n,food,medLib,foodLib,checkins});};
+  const delFood=id=>{const n=food.filter(e=>e.id!==id);setFood(n);scheduleSync({events,pending,meds,food:n,medLib,foodLib,checkins});};
+  const saveMedLib=lib=>{const clean=(lib||[]).filter(Boolean);setMedLib(clean);scheduleSync({events,pending,meds,food,medLib:clean,foodLib,checkins});};
+  const saveFoodLib=lib=>{const clean=(lib||[]).filter(Boolean);setFoodLib(clean);scheduleSync({events,pending,meds,food,medLib,foodLib:clean,checkins});};
+  const updateEvent=updated=>{
+    const np=pending.filter(e=>e.id!==updated.id);
+    const ne=[updated,...events.filter(e=>e.id!==updated.id)].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+    setPending(np);setEvents(ne);setEditing(null);
+    scheduleSync({events:ne,pending:np,meds,food,medLib,foodLib,checkins});
+    showFlash("✅ Event updated");
+  };
+  const updateMed=updated=>{const n=meds.map(e=>e.id===updated.id?updated:e).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setMeds(n);setEditing(null);scheduleSync({events,pending,meds:n,food,medLib,foodLib,checkins});showFlash("✅ Medication updated",C.purple);};
+  const updateFood=updated=>{const n=food.map(e=>e.id===updated.id?updated:e).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setFood(n);setEditing(null);scheduleSync({events,pending,meds,food:n,medLib,foodLib,checkins});showFlash("✅ Meal updated",C.teal);};
 
   const quickLog=()=>{
     const e={id:uid(),timestamp:nowISO(),pending:true};
-    if(!navigator.onLine){const q=loadQueue();q.push(e);saveQueue(q);setOfflineCount(q.length);showFlash("⚡ Timestamped (offline)",C.amber);setPending(p=>[e,...p]);}
-    else{const n=[e,...pending];setPending(n);scheduleSync();showFlash("⚡ Event timestamped!");}
+    if(!navigator.onLine){
+      const q=loadQueue();q.push(e);saveQueue(q);setOfflineCount(q.length);
+      const np=[e,...pending];setPending(np);
+      showFlash("⚡ Timestamped (offline)",C.amber);
+    }else{
+      const np=[e,...pending];setPending(np);
+      scheduleSync({events,pending:np,meds,food,medLib,foodLib,checkins});
+      showFlash("⚡ Event timestamped!");
+    }
   };
   const openReview=()=>{setRevIdx(0);setModal("review");};
   const handleReviewSave=details=>{
     const saved={...pending[revIdx],...details,pending:false};
-    const ne=[saved,...events];setEvents(ne);
-    const np=pending.filter((_,i)=>i!==revIdx);setPending(np);
-    scheduleSync();
+    const ne=[saved,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+    const np=pending.filter((_,i)=>i!==revIdx);
+    setEvents(ne);setPending(np);
+    scheduleSync({events:ne,pending:np,meds,food,medLib,foodLib,checkins});
     if(!np.length){setModal(null);showFlash("✅ All events reviewed!");}
     else setRevIdx(i=>Math.min(i,np.length-1));
   };
-  const handleReviewSkip=()=>{const n=[...pending.slice(0,revIdx),...pending.slice(revIdx+1),pending[revIdx]];setPending(n);if(revIdx>=n.length)setRevIdx(0);if(n.length===1){setModal(null);showFlash("Saved for later",C.amber);}};
-  const approveAll=()=>{const approved=pending.map(e=>({...e,pending:false}));const ne=[...approved,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));setEvents(ne);setPending([]);scheduleSync();showFlash(`✅ Approved ${approved.length} event${approved.length!==1?"s":""}!`);};
-  const resetApp=()=>{setEvents([]);setPending([]);setMeds([]);setFood([]);setMedLib([]);setFoodLib([]);setCheckins([]);scheduleSync();showFlash("🗑 All data cleared",C.amber);};
+  const handleReviewSkip=()=>{
+    const n=[...pending.slice(0,revIdx),...pending.slice(revIdx+1),pending[revIdx]];
+    setPending(n);
+    if(revIdx>=n.length)setRevIdx(0);
+    if(n.length===1){setModal(null);showFlash("Saved for later",C.amber);}
+  };
+  const approveAll=()=>{
+    const approved=pending.map(e=>({...e,pending:false}));
+    const ne=[...approved,...events].sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+    setEvents(ne);setPending([]);
+    scheduleSync({events:ne,pending:[],meds,food,medLib,foodLib,checkins});
+    showFlash(`✅ Approved ${approved.length} event${approved.length!==1?"s":""}!`);
+  };
+  const resetApp=()=>{
+    setEvents([]);setPending([]);setMeds([]);setFood([]);setMedLib([]);setFoodLib([]);setCheckins([]);
+    scheduleSync({events:[],pending:[],meds:[],food:[],medLib:[],foodLib:[],checkins:[]});
+    showFlash("🗑 All data cleared",C.amber);
+  };
   const handleImport=(imported,mode)=>{
-    const evtKey=e=>new Date(e.timestamp).toISOString().slice(0,16);
-    const itemKey=e=>`${new Date(e.timestamp).toISOString().slice(0,16)}|${(e.name||"").toLowerCase().trim()}`;
-    const dedup=(existing,incoming,keyFn)=>{const keys=new Set(existing.map(keyFn));return[...existing,...incoming.filter(e=>!keys.has(keyFn(e)))];};
+    // Use ID-based dedup — timestamp-based keys falsely flag records as duplicates
+    const byId=e=>e.id;
+    const dedup=(existing,incoming)=>{const ids=new Set(existing.map(byId));return[...existing,...incoming.filter(e=>e&&!ids.has(byId(e)))];};
     if(mode==="replace"){
       const ne=imported.events||[];const nm=imported.meds||[];const nf=imported.food||[];
       setEvents(ne.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setMeds(nm.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
       setFood(nf.sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp)));
-      scheduleSync();showFlash(`✅ Replaced with ${ne.length} events, ${nm.length} meds, ${nf.length} meals`);
+      scheduleSync({events:ne,pending:[],meds:nm,food:nf,medLib,foodLib,checkins});showFlash(`✅ Replaced with ${ne.length} events, ${nm.length} meds, ${nf.length} meals`);
     }else{
-      const ne=dedup(events,imported.events||[],evtKey).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
-      const nm=dedup(meds,imported.meds||[],itemKey).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
-      const nf=dedup(food,imported.food||[],itemKey).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      const ne=dedup(events,imported.events||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      const nm=dedup(meds,imported.meds||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
+      const nf=dedup(food,imported.food||[]).sort((a,b)=>new Date(b.timestamp)-new Date(a.timestamp));
       setEvents(ne);setMeds(nm);setFood(nf);
       const added=(ne.length-events.length)+(nm.length-meds.length)+(nf.length-food.length);
-      scheduleSync();showFlash(`✅ Merged — ${added} new record${added!==1?"s":""} added`);
+      scheduleSync({events:ne,pending,meds:nm,food:nf,medLib,foodLib,checkins});showFlash(`✅ Merged — ${added} new record${added!==1?"s":""} added`);
     }
   };
   const signOut=()=>{if(!window.confirm("Sign out?"))return;localStorage.removeItem('fnd_token');localStorage.removeItem('fnd_file_id');window.location.reload();};
-  const manualSync=()=>{setEvents(ev=>{setPending(pe=>{setMeds(me=>{setFood(fo=>{setMedLib(ml=>{setFoodLib(fl=>{setCheckins(ci=>{syncToDrive({events:ev,pending:pe,meds:me,food:fo,medLib:ml,foodLib:fl,checkins:ci}).then(()=>showFlash("☁️ Synced ✓"));return ci;});return fl;});return ml;});return fo;});return me;});return pe;});return ev;});};
+  const manualSync=()=>{
+    syncToDrive({events,pending,meds,food,medLib,foodLib,checkins})
+      .then(()=>showFlash("☁️ Synced ✓"));
+  };
 
   // ── Computed ──────────────────────────────────────────────
   const todayEvents=filterFrom(events,startOf("day"));
@@ -1401,8 +1495,17 @@ function App(){
   const medMins=sortedMins.length?sortedMins.length%2===0?Math.round((sortedMins[sortedMins.length/2-1]+sortedMins[sortedMins.length/2])/2):sortedMins[Math.floor(sortedMins.length/2)]:null;
   const last14=Array.from({length:14},(_,i)=>{const d=new Date(Date.now()-(13-i)*864e5);d.setHours(0,0,0,0);const de=new Date(d);de.setHours(23,59,59,999);const cnt=events.filter(e=>{const t=new Date(e.timestamp);return t>=d&&t<=de;}).length;const ord=n=>{const s=['th','st','nd','rd'],v=n%100;return n+(s[(v-20)%10]||s[v]||s[0]);};return{d,cnt,label:ord(d.getDate())};});
   const max14=Math.max(1,...last14.map(d=>d.cnt));
+  // Streak = consecutive days with no events, counting backwards from yesterday
+  // (today with events doesn't break the streak — you haven't "had a bad day yet")
   let streak=0;const curD=new Date();curD.setHours(0,0,0,0);
-  for(let d=new Date(curD);d>=new Date(curD.getTime()-90*864e5);d.setDate(d.getDate()-1)){if(events.some(e=>new Date(e.timestamp).toDateString()===d.toDateString()))break;streak++;}
+  const todayHasEvent=events.some(e=>new Date(e.timestamp).toDateString()===curD.toDateString());
+  if(!todayHasEvent){
+    // Today is clear — count today + prior clear days
+    for(let d=new Date(curD);d>=new Date(curD.getTime()-90*864e5);d.setDate(d.getDate()-1)){
+      if(events.some(e=>new Date(e.timestamp).toDateString()===d.toDateString()))break;
+      streak++;
+    }
+  }
   const clearDays30=Array.from({length:30},(_,i)=>{const d=new Date(Date.now()-i*864e5);d.setHours(0,0,0,0);return !events.some(e=>new Date(e.timestamp).toDateString()===d.toDateString());}).filter(Boolean).length;
   const last30=events.filter(e=>new Date(e.timestamp)>=new Date(Date.now()-30*864e5));
   const prior30=events.filter(e=>{const t=new Date(e.timestamp);return t>=new Date(Date.now()-60*864e5)&&t<new Date(Date.now()-30*864e5);});
